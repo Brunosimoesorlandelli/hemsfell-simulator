@@ -1,29 +1,41 @@
 """
-Aprendizado por reforco leve para decisões de IA.
+Aprendizado por reforco — política MLP (v3).
 
-Modelo:
-- Política linear por ação (contextual RL).
-- Atualização incremental por recompensa ao fim do turno.
-- Persistência em JSON para treinar em múltiplas execuções.
+Arquitetura:
+- MLPPolicy substitui LinearPolicy: rede neural rasa [N_feats → 64 → 32 → 1]
+  com ReLU, capaz de aprender interações não-lineares entre features
+  (ex: "atacar é bom QUANDO can_lethal_attack E opp_danger são altos juntos").
+  Treinada via REINFORCE com baseline de média móvel para reduzir variância.
+- Persistência em JSON (pesos das camadas) compatível com versões anteriores.
 
-Melhorias v2 (alto impacto):
-- [FIX] Features capturadas no momento de cada decisão (não mais snapshot
-  congelado no início do turno) — decisões dentro de phase_main agora
-  enxergam o campo já atualizado pelas jogadas anteriores do mesmo turno.
-- [NEW] Features de lethal: can_lethal_attack e opp_can_lethal permitem ao
-  agente reconhecer situações de vitória/derrota iminente e agir de forma
-  correspondente (all-in vs. defesa total).
-- [NEW] Retorno com desconto gamma em on_game_end: o crédito de vitória/
-  derrota propaga para decisões passadas com decaimento exponencial, fazendo
-  com que decisões boas de turnos anteriores sejam corretamente creditadas.
+Melhorias v3 (alto impacto):
+- [NEW] MLPPolicy: substitui produto escalar por rede 2 camadas com ReLU.
+  Capacidade expressiva suficiente para aprender estratégias condicionais
+  sem custo proibitivo de treino (< 5k parâmetros por scope/ação).
+- [NEW] Features de contexto de turno: cards_played_this_turn_norm,
+  energy_spent_ratio e field_delta_this_turn capturam o que já aconteceu
+  no turno atual, permitindo decisões sequenciais coerentes.
+- [FIX] record_invalid_action implementado: aplica penalidade leve (-0.5)
+  quando o agente escolhe uma ação que não pode ser executada, corrigindo
+  o AttributeError que ocorria em runtime.
+- [NEW] board_delta no reward de fim de turno: captura ganho/perda de
+  posição no campo (não apenas dano), melhorando o sinal de treino para
+  estratégias de controle e midrange.
+
+Mantidos de v2:
+- Features de lethal (can_lethal_attack, opp_can_lethal).
+- Retorno com desconto gamma para crédito temporal correto.
+- Features capturadas no momento exato de cada decisão (não snapshot).
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 from dataclasses import dataclass, field
+from typing import List
 
 from . import ai_engine as AI
 
@@ -57,10 +69,15 @@ def state_features(gs, player, opp) -> dict[str, float]:
 
     Chamado no momento exato de cada decisão — não no início do turno —
     garantindo que o agente enxerga o campo já modificado por jogadas
-    anteriores dentro do mesmo turno (fix do snapshot obsoleto).
+    anteriores dentro do mesmo turno.
 
-    Inclui features de lethal (can_lethal_attack, opp_can_lethal) que
-    permitem ao agente reconhecer situações de vitória ou derrota iminente.
+    v3: adicionadas features de contexto de turno:
+      - cards_played_this_turn_norm: quantas cartas já foram jogadas neste turno
+        (normalizado por 5). Permite ao agente reconhecer que já fez jogadas.
+      - energy_spent_ratio: fração da energia total já gasta. Sinaliza quando
+        o orçamento está quase esgotado vs. ainda há margem para jogar mais.
+      - field_delta_this_turn: variação no board advantage desde o início do turno.
+        Captura se as jogadas já feitas melhoraram ou pioraram a posição.
     """
     target_mana = _deck_target_mana(player)
     f_self = _board_value(player)
@@ -68,8 +85,6 @@ def state_features(gs, player, opp) -> dict[str, float]:
     mana_gap = (target_mana - player.max_energy) / 10.0
 
     # ── Features de lethal ────────────────────────────────────────────────
-    # Soma do dano potencial de cada lado considerando apenas atacantes validos.
-    # Criaturas com Furtivo contam no lethal do jogador pois sempre passam.
     my_attackers  = [c for c in player.field_creatures if c.can_attack()]
     opp_potential = [c for c in opp.field_creatures
                      if not c.tapped and (not c.sick or c.has_kw("Investida"))]
@@ -77,14 +92,41 @@ def state_features(gs, player, opp) -> dict[str, float]:
     my_dmg  = sum(c.cur_off() for c in my_attackers)
     opp_dmg = sum(c.cur_off() for c in opp_potential)
 
-    # 1.0 se o jogador pode eliminar o oponente neste combate
-    can_lethal = 1.0 if my_dmg >= opp.life else 0.0
-    # 1.0 se o oponente pode eliminar o jogador no proximo ataque
+    can_lethal     = 1.0 if my_dmg >= opp.life else 0.0
     opp_can_lethal = 1.0 if opp_dmg >= player.life else 0.0
 
-    # Urgencia: quao proximo cada lado esta de morrer (0 = ok, 1 = quase morto)
     self_danger = _clip(1.0 - player.life / 30.0, 0.0, 1.0)
     opp_danger  = _clip(1.0 - opp.life / 30.0,    0.0, 1.0)
+
+    # ── Features de contexto de turno (NEW v3) ────────────────────────────
+    # Quantas cartas já jogamos neste turno (normalizado).
+    # Informa ao agente que já agiu — importante para decisões de "passar" ou
+    # continuar jogando após gastar parte da energia.
+    cards_this_turn = getattr(player, "cards_played_this_turn", 0)
+    cards_played_norm = _clip(cards_this_turn / 5.0, 0.0, 1.0)
+
+    # Fração da energia total já gasta.
+    # energy_spent_ratio = 1.0 significa que não sobrou energia; 0.0 = turno novo.
+    total_budget = max(1, player.max_energy + player.reserve)
+    energy_remaining = player.energy + player.reserve
+    energy_spent_ratio = _clip(1.0 - energy_remaining / total_budget, 0.0, 1.0)
+
+    # Variação no board advantage desde o início do turno.
+    # Usa o snapshot guardado pelo on_turn_start; se não existir (primeiro turno),
+    # usa 0.0 como referência neutra.
+    pid = id(player)
+    snap = None
+    # Acessa o snapshot se disponível via atributo temporário injetado pelo runtime
+    _snap_ref = getattr(player, "_rl_turn_snap", None)
+    if _snap_ref is not None:
+        board_start_self = _snap_ref.board_self
+        board_start_opp  = _snap_ref.board_opp
+        field_delta = _clip(
+            ((f_self - f_opp) - (board_start_self - board_start_opp)) / 15.0,
+            -2.0, 2.0
+        )
+    else:
+        field_delta = 0.0
 
     return {
         # ── Identidade / tempo ────────────────────────────────────────────
@@ -99,9 +141,7 @@ def state_features(gs, player, opp) -> dict[str, float]:
         "self_danger":       self_danger,
         "opp_danger":        opp_danger,
 
-        # ── Lethal (NOVO) ─────────────────────────────────────────────────
-        # Estes dois sinais sao os de maior impacto imediato: reconhecer
-        # quando se pode ou precisa jogar tudo no ataque/defesa.
+        # ── Lethal ────────────────────────────────────────────────────────
         "can_lethal_attack": can_lethal,
         "opp_can_lethal":    opp_can_lethal,
 
@@ -123,26 +163,212 @@ def state_features(gs, player, opp) -> dict[str, float]:
         # ── Mao / deck ────────────────────────────────────────────────────
         "hand_self":         len(player.hand) / 10.0,
         "opp_creatures":     len(opp.field_creatures) / 5.0,
+
+        # ── Contexto de turno (NEW v3) ────────────────────────────────────
+        # Quantas cartas já jogamos neste turno — permite ao agente saber
+        # que já agiu antes de decidir jogar mais ou passar.
+        "cards_played_this_turn_norm": cards_played_norm,
+
+        # Fração da energia já gasta — sinaliza quando o orçamento se esgota.
+        "energy_spent_ratio":          energy_spent_ratio,
+
+        # Variação no board advantage desde o início do turno — mede se as
+        # jogadas já feitas melhoraram a posição antes de decidir a próxima.
+        "field_delta_this_turn":       field_delta,
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────
-#  POLITICA LINEAR
+#  POLÍTICA MLP (v3 — substitui LinearPolicy)
 # ─────────────────────────────────────────────────────────────────────────
+#
+#  Arquitetura por scope+ação: [N_feats → H1 → H2 → 1] com ReLU.
+#  Isso permite aprender relações NÃO-LINEARES entre features — por exemplo:
+#    "atacar é bom QUANDO (can_lethal_attack=1 AND opp_danger > 0.7)"
+#  é impossível de representar num produto escalar, mas trivial para uma MLP.
+#
+#  Treinamento: gradiente manual de REINFORCE (sem PyTorch para manter zero
+#  dependências externas). A atualização segue:
+#    Δw = alpha * (reward - baseline) * ∂score/∂w
+#  onde baseline é a média móvel dos rewards recentes (reduz variância).
+#
+#  Persistência: pesos salvos em JSON (lista de matrizes) por chave
+#  "{scope}|{action}", compatível com o formato de save/load anterior.
 
-class LinearPolicy:
+_MLP_H1 = 64   # neurônios na 1ª camada oculta
+_MLP_H2 = 32   # neurônios na 2ª camada oculta
+
+
+def _relu(x: float) -> float:
+    return x if x > 0.0 else 0.0
+
+
+def _relu_vec(v: List[float]) -> List[float]:
+    return [_relu(x) for x in v]
+
+
+def _dot(a: List[float], b: List[float]) -> float:
+    return sum(x * y for x, y in zip(a, b))
+
+
+def _mat_vec(mat: List[List[float]], vec: List[float]) -> List[float]:
+    """Multiplica matriz (linhas × colunas) por vetor coluna."""
+    return [_dot(row, vec) for row in mat]
+
+
+def _add_vec(a: List[float], b: List[float]) -> List[float]:
+    return [x + y for x, y in zip(a, b)]
+
+
+def _zeros(n: int) -> List[float]:
+    return [0.0] * n
+
+
+def _zeros_mat(rows: int, cols: int) -> List[List[float]]:
+    return [[0.0] * cols for _ in range(rows)]
+
+
+def _rand_init(rows: int, cols: int) -> List[List[float]]:
+    """He initialization: escala √(2/fan_in) para camadas ReLU."""
+    scale = math.sqrt(2.0 / cols)
+    return [[random.gauss(0.0, scale) for _ in range(cols)] for _ in range(rows)]
+
+
+class _MLPNet:
+    """
+    Rede MLP: [N_in → H1 → H2 → 1].
+    Mantém os pesos e as ativações intermediárias do último forward pass
+    para calcular o gradiente analítico em backward().
+    """
+
+    def __init__(self, n_in: int):
+        self.n_in = n_in
+        # Camada 1: H1 × N_in
+        self.W1: List[List[float]] = _rand_init(_MLP_H1, n_in)
+        self.b1: List[float]       = _zeros(_MLP_H1)
+        # Camada 2: H2 × H1
+        self.W2: List[List[float]] = _rand_init(_MLP_H2, _MLP_H1)
+        self.b2: List[float]       = _zeros(_MLP_H2)
+        # Camada de saída: 1 × H2 (vetor linha)
+        self.W3: List[float]       = _zeros(_MLP_H2)
+        self.b3: float             = 0.0
+
+        # Ativações salvas pelo último forward() para uso em backward()
+        self._x:  List[float] = []
+        self._h1: List[float] = []
+        self._h2: List[float] = []
+
+    # ── Forward ───────────────────────────────────────────────────────────
+    def forward(self, x: List[float]) -> float:
+        self._x  = x
+        z1       = _add_vec(_mat_vec(self.W1, x),  self.b1)
+        self._h1 = _relu_vec(z1)
+        z2       = _add_vec(_mat_vec(self.W2, self._h1), self.b2)
+        self._h2 = _relu_vec(z2)
+        return _dot(self.W3, self._h2) + self.b3
+
+    # ── Backward (REINFORCE): Δw = alpha * delta * ∂score/∂w ─────────────
+    def backward(self, delta: float, alpha: float):
+        """
+        Atualização de gradiente ascendente (maximizar score).
+        delta = reward - baseline (sinal de REINFORCE).
+        """
+        # Gradiente da camada de saída
+        # ∂score/∂W3[j] = h2[j],  ∂score/∂b3 = 1
+        for j in range(_MLP_H2):
+            self.W3[j] += alpha * delta * self._h2[j]
+        self.b3 += alpha * delta
+
+        # Backprop para h2: dL/dz2[j] = W3[j] * relu'(z2[j])
+        # relu'(z) = 1 se h2[j] > 0, senão 0
+        dz2 = [
+            (self.W3[j] * delta if self._h2[j] > 0.0 else 0.0)
+            for j in range(_MLP_H2)
+        ]
+
+        # Gradiente W2 e b2
+        for i in range(_MLP_H2):
+            if dz2[i] == 0.0:
+                continue
+            for j in range(_MLP_H1):
+                self.W2[i][j] += alpha * dz2[i] * self._h1[j]
+            self.b2[i] += alpha * dz2[i]
+
+        # Backprop para h1: dL/dz1[j] = Σ_i W2[i][j] * dz2[i]
+        dz1 = [
+            sum(self.W2[i][j] * dz2[i] for i in range(_MLP_H2)) *
+            (1.0 if self._h1[j] > 0.0 else 0.0)
+            for j in range(_MLP_H1)
+        ]
+
+        # Gradiente W1 e b1
+        for i in range(_MLP_H1):
+            if dz1[i] == 0.0:
+                continue
+            for j in range(self.n_in):
+                self.W1[i][j] += alpha * dz1[i] * self._x[j]
+            self.b1[i] += alpha * dz1[i]
+
+    # ── Serialização ──────────────────────────────────────────────────────
+    def to_dict(self) -> dict:
+        return {"W1": self.W1, "b1": self.b1,
+                "W2": self.W2, "b2": self.b2,
+                "W3": self.W3, "b3": self.b3,
+                "n_in": self.n_in}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "_MLPNet":
+        net = cls.__new__(cls)
+        net.n_in = d["n_in"]
+        net.W1 = d["W1"]; net.b1 = d["b1"]
+        net.W2 = d["W2"]; net.b2 = d["b2"]
+        net.W3 = d["W3"]; net.b3 = d["b3"]
+        net._x = []; net._h1 = []; net._h2 = []
+        return net
+
+
+class MLPPolicy:
+    """
+    Política MLP por scope+ação.
+
+    Interface idêntica à LinearPolicy anterior para compatibilidade com
+    o RLEpisodeRuntime — apenas score(), choose(), update(), save() e load().
+
+    Baseline: média móvel exponencial dos rewards por scope (reduz variância
+    do gradiente REINFORCE sem introduzir bias assintótico).
+    """
+
+    _BASELINE_ALPHA = 0.05   # taxa de atualização da baseline EMA
+
     def __init__(self):
-        self.weights: dict[str, dict[str, float]] = {}
+        # chave = "{scope}|{action}" → _MLPNet
+        self._nets:     dict[str, _MLPNet]  = {}
+        # baseline EMA por scope (não por ação) para estabilidade
+        self._baseline: dict[str, float]    = {}
+        # dimensão do vetor de features (fixada na primeira chamada)
+        self._n_in: int = 0
 
-    def _slot(self, scope: str, action: str) -> dict[str, float]:
-        key = f"{scope}|{action}"
-        if key not in self.weights:
-            self.weights[key] = {"bias": 0.0}
-        return self.weights[key]
+    def _key(self, scope: str, action: str) -> str:
+        return f"{scope}|{action}"
+
+    def _net(self, scope: str, action: str) -> _MLPNet:
+        k = self._key(scope, action)
+        if k not in self._nets:
+            if self._n_in == 0:
+                raise RuntimeError("MLPPolicy: n_in não inicializado. "
+                                   "Chame prime() antes do primeiro score().")
+            self._nets[k] = _MLPNet(self._n_in)
+        return self._nets[k]
+
+    def prime(self, n_in: int):
+        """Define a dimensão do vetor de features. Chamado uma vez no primeiro uso."""
+        if self._n_in == 0:
+            self._n_in = n_in
 
     def score(self, scope: str, action: str, feats: dict[str, float]) -> float:
-        w = self._slot(scope, action)
-        return sum(w.get(k, 0.0) * v for k, v in feats.items())
+        x = list(feats.values())
+        self.prime(len(x))
+        return self._net(scope, action).forward(x)
 
     def choose(self, scope: str, actions: list[str], feats: dict[str, float],
                epsilon: float = 0.0) -> str:
@@ -150,32 +376,79 @@ class LinearPolicy:
             return "pass"
         if epsilon > 0.0 and random.random() < epsilon:
             return random.choice(actions)
-        scored = [(self.score(scope, a, feats), a) for a in actions]
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return scored[0][1]
+        x = list(feats.values())
+        self.prime(len(x))
+        best_action = actions[0]
+        best_score  = float("-inf")
+        for a in actions:
+            s = self._net(scope, a).forward(x)
+            if s > best_score:
+                best_score  = s
+                best_action = a
+        return best_action
 
     def update(self, scope: str, action: str, feats: dict[str, float],
                reward: float, alpha: float):
-        w    = self._slot(scope, action)
-        pred = self.score(scope, action, feats)
-        err  = reward - pred
-        for k, v in feats.items():
-            w[k] = w.get(k, 0.0) + alpha * err * v
+        """
+        Atualização REINFORCE com baseline EMA.
+        delta = reward - baseline[scope] → reduz variância sem bias.
+        """
+        x = list(feats.values())
+        self.prime(len(x))
 
-    def save(self, path: str):
+        # Atualiza baseline EMA do scope
+        bl = self._baseline.get(scope, 0.0)
+        bl = bl + self._BASELINE_ALPHA * (reward - bl)
+        self._baseline[scope] = bl
+
+        delta = reward - bl
+        net   = self._net(scope, action)
+        net.forward(x)          # garante ativações atualizadas
+        net.backward(delta, alpha)
+
+    def save(self, path: str,
+             metadata: dict | None = None,
+             checkpoint_tag: str | None = None):
+        """
+        Salva a política em JSON.
+
+        metadata e checkpoint_tag são opcionais — aceitos para compatibilidade
+        com rl_trainer.py (que os usa para rastrear checkpoints e config de treino).
+        São gravados no JSON mas não afetam o comportamento da política.
+        """
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        data = {
+            "version":        3,
+            "n_in":           self._n_in,
+            "baseline":       self._baseline,
+            "nets":           {k: net.to_dict() for k, net in self._nets.items()},
+            "metadata":       metadata or {},
+            "checkpoint_tag": checkpoint_tag or "",
+        }
         with open(path, "w", encoding="utf-8") as f:
-            json.dump({"weights": self.weights}, f, ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_ascii=False)
 
     @classmethod
-    def load(cls, path: str) -> "LinearPolicy":
+    def load(cls, path: str) -> "MLPPolicy":
         pol = cls()
         if not os.path.exists(path):
             return pol
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        pol.weights = data.get("weights", {})
+        version = data.get("version", 1)
+        if version < 3:
+            # Arquivo antigo (LinearPolicy): descarta pesos incompatíveis.
+            # A rede começa do zero mas mantém compatibilidade de API.
+            return pol
+        pol._n_in     = data.get("n_in", 0)
+        pol._baseline = data.get("baseline", {})
+        for k, net_d in data.get("nets", {}).items():
+            pol._nets[k] = _MLPNet.from_dict(net_d)
         return pol
+
+
+# Alias para compatibilidade com código que instancie LinearPolicy diretamente.
+LinearPolicy = MLPPolicy
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -239,7 +512,7 @@ class RLEpisodeRuntime:
 
     def on_turn_start(self, gs, player, opp):
         pid = id(player)
-        self.turn_snaps[pid] = _TurnSnapshot(
+        snap = _TurnSnapshot(
             self_life   = player.life,
             opp_life    = opp.life,
             hero_level  = player.hero_level,
@@ -248,6 +521,10 @@ class RLEpisodeRuntime:
             board_opp   = _board_value(opp),
             target_mana = _deck_target_mana(player),
         )
+        self.turn_snaps[pid] = snap
+        # Injeta referência ao snap no player para que state_features()
+        # possa calcular field_delta_this_turn sem precisar do runtime.
+        player._rl_turn_snap = snap
         if pid not in self.decisions:
             self.decisions[pid] = []
 
@@ -289,6 +566,23 @@ class RLEpisodeRuntime:
         )
         return style
 
+    # ── Ação inválida (NEW v3) ────────────────────────────────────────────
+    #
+    # Chamado pelo simulator quando o agente escolhe uma ação que não pode
+    # ser executada (ex: "play_best_creature" sem criaturas jogáveis).
+    # Aplica penalidade leve para desincentivar ações inválidas sem colapsar
+    # o aprendizado — o sinal é proporcional ao alpha atual.
+
+    def record_invalid_action(self, player, action: str):
+        if not self.training:
+            return
+        pid   = id(player)
+        scope = self._scope(player, "main")
+        feats = {"bias": 1.0}
+        self.policy.update(scope, action, feats, -0.5, self.alpha)
+        # Incrementa contador para summarize()
+        self._invalid_count = getattr(self, "_invalid_count", 0) + 1
+
     # ── Fim de turno: reward imediato ─────────────────────────────────────
 
     def on_turn_end(self, gs, player, opp):
@@ -305,24 +599,34 @@ class RLEpisodeRuntime:
         before_close = 1.0 - abs(snap.max_energy - snap.target_mana) / 10.0
         after_close  = 1.0 - abs(player.max_energy - snap.target_mana) / 10.0
 
+        # ── board_delta (NEW v3) ──────────────────────────────────────────
+        # Captura variação no board advantage durante o turno.
+        # Corrige o viés do reward anterior que só recompensava dano direto,
+        # ignorando turnos que limpam o campo inimigo ou constroem posição.
+        board_self_now   = _board_value(player)
+        board_opp_now    = _board_value(opp)
+        board_adv_before = snap.board_self - snap.board_opp
+        board_adv_after  = board_self_now  - board_opp_now
+        board_delta      = board_adv_after - board_adv_before
+        board_delta_reward = _clip(board_delta / 30.0, -1.5, 1.5) * 0.6
+
         reward  = 0.0
         reward += 1.25 * damage_dealt
         reward -= 1.05 * damage_taken
         reward += 3.2  * lvl_gain
         reward += 0.8  * (after_close - before_close)
         reward += 0.5  * mana_gain
+        reward += board_delta_reward          # NEW v3
 
         if player.max_energy >= snap.target_mana:
             reward += 0.25
         if player.max_energy > snap.target_mana + 1:
             reward -= 0.25 * (player.max_energy - (snap.target_mana + 1))
 
-        # Saymon usa vida como recurso; reduz penalidade quando ha ganho de
+        # Saymon usa vida como recurso; reduz penalidade quando há ganho de
         # controle de campo em troca de vida perdida.
         if player.hero.id == "hero_saymon_primeiro" and damage_taken > 0:
-            board_before = snap.board_self - snap.board_opp
-            board_after  = _board_value(player) - _board_value(opp)
-            if board_after > board_before:
+            if board_adv_after > board_adv_before:
                 reward += 0.65 * damage_taken
 
         if player.life <= 6:
@@ -387,3 +691,58 @@ class RLEpisodeRuntime:
                 steps_from_end = n - 1 - i
                 discounted = terminal_bonus * (self.gamma ** steps_from_end)
                 self.policy.update(d.scope, d.action, d.feats, discounted, self.alpha)
+
+    # ── Sumário do episódio (NEW v3) ──────────────────────────────────────
+    #
+    # Chamado pelo trainer após cada jogo para coletar métricas de diagnóstico.
+    # Retorna um dict compatível com o que rl_trainer.py espera em:
+    #   summary = runtime.summarize()
+    #   summary["reward_avg"]
+    #   summary["invalid_action_rate"]
+    #   summary["pass_rate"]
+    #   summary["action_distribution"]
+
+    def summarize(self) -> dict:
+        """
+        Retorna métricas do episódio para logging no trainer.
+
+        - reward_avg: média dos rewards imediatos acumulados no turno (last_reward).
+        - invalid_action_rate: fração de decisões que foram inválidas (penalizadas).
+        - pass_rate: fração de decisões de fase principal onde a ação foi "pass".
+        - action_distribution: contagem de ações por scope, útil para detectar
+          colapso de política (ex: agente sempre escolhe "pass").
+        """
+        all_rewards = list(self.last_reward.values())
+        reward_avg = sum(all_rewards) / max(1, len(all_rewards))
+
+        # Conta decisões inválidas registradas via record_invalid_action
+        invalid_count = getattr(self, "_invalid_count", 0)
+        total_decisions = sum(
+            len(dlist) for dlist in self.decisions.values()
+        )
+        invalid_rate = invalid_count / max(1, total_decisions)
+
+        # Conta ações "pass" na fase principal
+        pass_count = 0
+        main_count = 0
+        action_dist: dict[str, dict[str, int]] = {}
+        for dlist in self.decisions.values():
+            for d in dlist:
+                scope_label = d.scope.split(":")[0] if ":" in d.scope else d.scope
+                action_dist.setdefault(scope_label, {})
+                action_dist[scope_label][d.action] = (
+                    action_dist[scope_label].get(d.action, 0) + 1
+                )
+                if "main" in d.scope:
+                    main_count += 1
+                    if d.action == "pass":
+                        pass_count += 1
+
+        pass_rate = pass_count / max(1, main_count)
+
+        return {
+            "reward_avg":          reward_avg,
+            "invalid_action_rate": invalid_rate,
+            "pass_rate":           pass_rate,
+            "action_distribution": action_dist,
+        }

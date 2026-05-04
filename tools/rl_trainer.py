@@ -12,7 +12,7 @@ from collections import defaultdict
 from engine import logger
 from engine.loader import build_deck_for_hero
 from engine.models import Player, reset_iid
-from engine.rl_agent import DQNPolicy, RLEpisodeRuntime
+from engine.rl_agent import MLPPolicy, RLEpisodeRuntime
 from engine.simulator import GameState
 
 
@@ -64,10 +64,9 @@ def _run_single_game(
     data: dict,
     card_pool: dict,
     tags_db: dict,
-    policy: DQNPolicy | None,
+    policy: MLPPolicy | None,
     training: bool,
     epsilon: float,
-    reward_profile: str,
     seed: int | None,
 ):
     if seed is not None:
@@ -87,7 +86,8 @@ def _run_single_game(
             training=training,
             epsilon=epsilon if training else 0.0,
             alpha=0.03,
-            reward_profile=reward_profile,
+            # reward_profile removido: v3 unifica o perfil de reward no próprio
+            # on_turn_end (board_delta + damage). Não há seleção por string.
         )
         gs.rl_runtime = runtime
     result = gs.run()
@@ -95,14 +95,13 @@ def _run_single_game(
 
 
 def _evaluate_policy_snapshot(
-    policy: DQNPolicy,
+    policy: MLPPolicy,
     pairs: list[tuple[str, str]],
     data: dict,
     card_pool: dict,
     tags_db: dict,
     seeds: list[int],
     games_per_seed: int,
-    reward_profile: str,
 ) -> dict:
     per_pair = {}
     total_base_wins = 0
@@ -119,12 +118,12 @@ def _evaluate_policy_snapshot(
                 base_res, _ = _run_single_game(
                     h1, h2, data, card_pool, tags_db,
                     policy=None, training=False, epsilon=0.0,
-                    reward_profile=reward_profile, seed=game_seed,
+                    seed=game_seed,
                 )
                 rl_res, _ = _run_single_game(
                     h1, h2, data, card_pool, tags_db,
                     policy=policy, training=False, epsilon=0.0,
-                    reward_profile=reward_profile, seed=game_seed,
+                    seed=game_seed,
                 )
                 pair_games += 1
                 total_games += 1
@@ -178,7 +177,6 @@ def train_policy(
     epsilon_end: float = 0.02,
     alpha: float = 0.03,
     seed: int | None = None,
-    reward_profile: str = "v1",
     eval_every: int = 0,
     curriculum: str = "light",
     save_best: bool = False,
@@ -187,7 +185,7 @@ def train_policy(
         random.seed(seed)
 
     logger.set_verbose(False)
-    policy = DQNPolicy.load(policy_path, 25)
+    policy = MLPPolicy.load(policy_path)
     deck_heroes = [d["hero_id"] for d in data.get("decks", [])]
     if not deck_heroes:
         raise ValueError("Nenhum deck encontrado para treino RL.")
@@ -228,7 +226,6 @@ def train_policy(
             policy=policy,
             training=True,
             epsilon=epsilon,
-            reward_profile=reward_profile,
             seed=ep_seed,
         )
         wins[result["winner"]] = wins.get(result["winner"], 0) + 1
@@ -273,7 +270,6 @@ def train_policy(
                 tags_db=tags_db,
                 seeds=eval_seed_set,
                 games_per_seed=eval_games_per_seed,
-                reward_profile=reward_profile,
             )
             promoted = _passes_promotion(snapshot, critical_pairs)
             print(
@@ -293,7 +289,6 @@ def train_policy(
                             "eval_summary": best_eval,
                             "training_config": {
                                 "episodes": episodes,
-                                "reward_profile": reward_profile,
                                 "eval_every": eval_every,
                                 "curriculum": curriculum,
                                 "save_best": save_best,
@@ -315,7 +310,6 @@ def train_policy(
             "epsilon_end": epsilon_end,
             "alpha": alpha,
             "seed": seed,
-            "reward_profile": reward_profile,
             "eval_every": eval_every,
             "curriculum": curriculum,
             "save_best": save_best,

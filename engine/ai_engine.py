@@ -93,6 +93,64 @@ def analyze_opponent(opp: "Player") -> OpponentProfile:
 
 
 # ─────────────────────────────────────────────────────────
+#  CACHE DE PERFIL DO OPONENTE (NEW v3)
+# ─────────────────────────────────────────────────────────
+#
+# analyze_opponent() percorre todo o deck/mão/campo/cemitério — O(n) por
+# chamada. Como é invocado múltiplas vezes por fase (hand_card_score,
+# _spell_score, choose_attackers, choose_blockers...), o custo se acumula.
+#
+# Solução: cache por (id(opp), turno_chave) onde turno_chave combina o
+# tamanho dos conjuntos que mudam durante uma fase. O cache invalida
+# automaticamente quando o campo ou mão do oponente muda — sem estado
+# manual para limpar.
+#
+# Formato: {cache_key → OpponentProfile}
+# Cache é um dict simples limitado a 4 entradas para evitar crescimento
+# (no máximo 2 jogadores × 2 fases distintas por turno).
+
+_PROFILE_CACHE: dict = {}
+_PROFILE_CACHE_MAX = 4
+
+
+def _profile_cache_key(opp: "Player") -> tuple:
+    """
+    Chave de cache que invalida quando o estado observável do oponente muda.
+    Usa tamanhos dos conjuntos (field, hand, graveyard, spells_field) e o
+    hero.id — suficiente para detectar qualquer jogada ou destruição.
+    """
+    return (
+        id(opp),
+        opp.hero.id,
+        len(opp.field_creatures),
+        len(opp.hand),
+        len(opp.graveyard),
+        len(opp.spells_field),
+        len(opp.deck),
+    )
+
+
+def get_opponent_profile(opp: "Player") -> OpponentProfile:
+    """
+    Versão cacheada de analyze_opponent().
+
+    Use esta função em todo o código que antes chamava analyze_opponent(opp)
+    diretamente — a interface é idêntica, mas evita recalcular O(n) quando
+    o estado do oponente não mudou desde a última chamada neste turno.
+    """
+    global _PROFILE_CACHE
+    key = _profile_cache_key(opp)
+    if key in _PROFILE_CACHE:
+        return _PROFILE_CACHE[key]
+    # Limpa cache se cresceu demais (LRU simples: descarta tudo)
+    if len(_PROFILE_CACHE) >= _PROFILE_CACHE_MAX:
+        _PROFILE_CACHE = {}
+    profile = analyze_opponent(opp)
+    _PROFILE_CACHE[key] = profile
+    return profile
+
+
+# ─────────────────────────────────────────────────────────
 #  AVALIAÇÃO DE CARTA EM CAMPO
 # ─────────────────────────────────────────────────────────
 
@@ -112,7 +170,7 @@ def card_value(card: "CardInst", owner: "Player") -> float:
 def hand_card_score(card: "CardInst", owner: "Player",
                     opp: "Player", turn: int,
                     profile: OpponentProfile | None = None) -> float:
-    profile = profile or analyze_opponent(opp)
+    profile = profile or get_opponent_profile(opp)
 
     if card.card_type == "creature":
         base = card_value(card, owner) - card.cost * 0.6
@@ -162,7 +220,7 @@ def hand_card_score(card: "CardInst", owner: "Player",
 
 def _spell_score(card: "CardInst", owner: "Player", opp: "Player",
                  profile: OpponentProfile | None = None) -> float:
-    profile = profile or analyze_opponent(opp)
+    profile = profile or get_opponent_profile(opp)
     tags  = card.effect_tags
     score = 0.5
 
@@ -354,7 +412,7 @@ def _get_defensor_x(card: "CardInst") -> int:
 def choose_card_to_play(player: "Player", opp: "Player",
                         turn: int, excluded_iids: set[int] | None = None) -> Optional["CardInst"]:
     excluded_iids = excluded_iids or set()
-    profile = analyze_opponent(opp)
+    profile = get_opponent_profile(opp)
     cost_red = getattr(player, "_cost_reduction_next", 0)
     playable = []
 
@@ -436,7 +494,7 @@ def choose_best_play_sequence(player: "Player", opp: "Player",
     """
     from itertools import combinations as _combos
 
-    profile = analyze_opponent(opp)
+    profile = get_opponent_profile(opp)
     cost_red = getattr(player, "_cost_reduction_next", 0)
     budget = player.total_energy()
 
@@ -585,7 +643,7 @@ def _expected_attack_value(attacker: "CardInst", opp: "Player",
 
 
 def choose_attackers(player: "Player", opp: "Player") -> list["CardInst"]:
-    profile = analyze_opponent(opp)
+    profile = get_opponent_profile(opp)
     can_attack = [c for c in player.field_creatures if c.can_attack()]
     if not can_attack:
         return []
@@ -633,7 +691,7 @@ def choose_attackers(player: "Player", opp: "Player") -> list["CardInst"]:
 
 def _how_many_defenders_needed(player: "Player", opp: "Player",
                                profile: OpponentProfile | None = None) -> int:
-    profile = profile or analyze_opponent(opp)
+    profile = profile or get_opponent_profile(opp)
     # Criaturas do oponente que podem atacar no próximo turno
     opp_potential = [c for c in opp.field_creatures
                      if (not c.tapped or c.has_kw("Alerta"))
@@ -711,7 +769,7 @@ def _combat_outcome(atk: "CardInst", blk: "CardInst") -> dict:
 def _block_trade_score(atk: "CardInst", blk: "CardInst",
                        owner: "Player", opp: "Player",
                        profile: OpponentProfile | None = None) -> float:
-    profile = profile or analyze_opponent(opp)
+    profile = profile or get_opponent_profile(opp)
     outcome  = _combat_outcome(atk, blk)
     score    = 0.0
     atk_val  = card_value(atk, opp)
@@ -939,7 +997,7 @@ def evaluate_state(player: "Player", opp: "Player") -> float:
 
 def should_play_card_now(card: "CardInst", player: "Player",
                          opp: "Player", turn: int) -> bool:
-    profile = analyze_opponent(opp)
+    profile = get_opponent_profile(opp)
     if card.has_kw("Investida") and opp.field_creatures:
         return True
     if player.life <= 8:
