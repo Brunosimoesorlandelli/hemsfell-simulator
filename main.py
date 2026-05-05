@@ -5,15 +5,14 @@
 
 Comandos disponíveis:
 
-  sim      Simula partidas entre dois heróis
-  rl-train Treina política de RL em várias partidas
-  rl-eval  Avalia base vs política RL treinada
+  sim          Simula partidas entre dois heróis
+  rl-train     Treina política de RL em várias partidas
+  rl-eval      Avalia base vs política RL treinada
   deck-metrics Gera métricas estratégicas por deck
-  view     Visualizador Pygame passo a passo
-  play     Modo jogável (HUD visual por padrão)
-  matrix   Tabela de matchups todos-vs-todos
-  inspect  Inspeciona o deck de um herói
-  heroes   Lista todos os heróis disponíveis
+  deck-lab     Ferramenta de tuning e benchmark de variantes de deck
+  matrix       Tabela de matchups todos-vs-todos
+  inspect      Inspeciona o deck de um herói
+  heroes       Lista todos os heróis disponíveis
 
 Exemplos:
   python main.py sim --deck1 hero_gimble --deck2 hero_tifon
@@ -23,9 +22,6 @@ Exemplos:
   python main.py rl-train --episodes 1000 --all-matchups
   python main.py rl-eval --all-matchups --games 100 --policy-path reports/rl_policy.json
   python main.py deck-metrics --games 50
-  python main.py view --deck1 hero_gimble --deck2 hero_tifon
-  python main.py play --deck-player hero_gimble --deck-ai hero_tifon
-  python main.py play --deck-player hero_gimble --deck-ai hero_tifon --terminal
   python main.py matrix --games 100
   python main.py inspect --deck hero_gimble
   python main.py heroes
@@ -35,7 +31,6 @@ import argparse
 import os
 import sys
 
-# Garante que o projeto está no path quando executado da raiz
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from engine.loader import load_data, build_card_pool, load_tags, hero_list
@@ -101,7 +96,6 @@ def cmd_rl_train(args):
         epsilon_end=args.epsilon_end,
         alpha=args.alpha,
         seed=args.seed,
-        reward_profile=args.reward_profile,
         eval_every=args.eval_every,
         curriculum=args.curriculum,
         save_best=args.save_best,
@@ -180,81 +174,6 @@ def cmd_deck_metrics(args):
         print(f"\n📄 Relatório salvo em: {out}")
 
 
-def cmd_view(args):
-    try:
-        import pygame  # noqa: F401
-    except ImportError:
-        print("❌ Pygame não instalado. Execute:  pip install pygame")
-        sys.exit(1)
-
-    from ui.viewer import Viewer
-    from ui.instrumented import run_instrumented
-
-    data      = load_data()
-    card_pool = build_card_pool(data)
-    tags_db   = load_tags()
-    viewer    = Viewer()
-
-    while True:
-        print(f"\n🎮 Simulando {args.deck1} vs {args.deck2}…")
-        snaps = run_instrumented(args.deck1, args.deck2, data, card_pool, tags_db)
-        print(f"   {len(snaps)} snapshots capturados.\n")
-        viewer.load_snapshots(snaps)
-        result = viewer.run()
-        if result != "restart":
-            break
-
-    import pygame
-    pygame.quit()
-    print("👋 Visualizador encerrado.")
-
-def cmd_play(args):
-    data      = load_data()
-    card_pool = build_card_pool(data)
-    tags_db   = load_tags()
-
-    print(f"\n🎮 Você: {args.deck_player}  vs  IA: {args.deck_ai}")
-    if args.seed is not None:
-        print(f"🎲 Seed fixa: {args.seed}")
-
-    if args.terminal:
-        from tools.play_mode import run_playable_match
-        result = run_playable_match(
-            hero_player=args.deck_player,
-            hero_ai=args.deck_ai,
-            data=data,
-            card_pool=card_pool,
-            tags_db=tags_db,
-            seed=args.seed,
-        )
-    else:
-        try:
-            import pygame  # noqa: F401
-        except ImportError:
-            print("❌ Pygame não instalado. Execute:  pip install pygame")
-            sys.exit(1)
-
-        from ui.play_hud import run_playable_match_hud, QuitRequested
-        try:
-            result = run_playable_match_hud(
-                hero_player=args.deck_player,
-                hero_ai=args.deck_ai,
-                data=data,
-                card_pool=card_pool,
-                tags_db=tags_db,
-                seed=args.seed,
-            )
-        except QuitRequested:
-            print("\n👋 Partida encerrada pelo jogador.")
-            return
-
-    print("\n🏁 Partida encerrada")
-    print(f"Vencedor: {result['winner']}")
-    print(f"Turnos:   {result['turns']}")
-    print(f"Vida final {result['p1_name']}: {result['p1_life']}")
-    print(f"Vida final {result['p2_name']}: {result['p2_life']}")
-
-
 def cmd_matrix(args):
     from tools.matchup_matrix import build_matrix
     import os
@@ -299,9 +218,9 @@ def cmd_deck_lab(args):
         run_variant,
     )
 
-    data = load_data()
+    data      = load_data()
     card_pool = build_card_pool(data)
-    tags_db = load_tags()
+    tags_db   = load_tags()
 
     if args.decklab_cmd == "create":
         variant = create_variant(
@@ -409,7 +328,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_rl.add_argument("--epsilon-end", type=float, default=0.02)
     p_rl.add_argument("--alpha", type=float, default=0.03)
     p_rl.add_argument("--seed", type=int, default=None)
-    p_rl.add_argument("--reward-profile", choices=["v1", "v2_winrate"], default="v2_winrate")
     p_rl.add_argument("--eval-every", type=int, default=0,
                       help="Executa avaliação curta a cada N episódios")
     p_rl.add_argument("--curriculum", choices=["light", "off"], default="light")
@@ -434,20 +352,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_dm = sub.add_parser("deck-metrics", help="Gera métricas estratégicas por deck")
     p_dm.add_argument("--games", type=int, default=50)
     p_dm.add_argument("--output", default="reports/deck_metrics.txt")
-
-    # view
-    p_view = sub.add_parser("view", help="Visualizador Pygame passo a passo")
-    p_view.add_argument("--deck1", default="hero_gimble")
-    p_view.add_argument("--deck2", default="hero_tifon")
-
-    # play
-    p_play = sub.add_parser("play", help="Modo jogável (HUD visual por padrão)")
-    p_play.add_argument("--deck-player", default="hero_gimble")
-    p_play.add_argument("--deck-ai", default="hero_tifon")
-    p_play.add_argument("--seed", type=int, default=None,
-                        help="Seed opcional para partida reproduzível")
-    p_play.add_argument("--terminal", action="store_true",
-                        help="Usa o modo antigo via terminal (sem HUD)")
 
     # matrix
     p_mat = sub.add_parser("matrix", help="Tabela de matchups todos-vs-todos")
@@ -505,16 +409,14 @@ def main():
         return
 
     dispatch = {
-        "sim":     cmd_sim,
-        "rl-train": cmd_rl_train,
-        "rl-eval": cmd_rl_eval,
+        "sim":          cmd_sim,
+        "rl-train":     cmd_rl_train,
+        "rl-eval":      cmd_rl_eval,
         "deck-metrics": cmd_deck_metrics,
-        "view":    cmd_view,
-        "play":    cmd_play,
-        "matrix":  cmd_matrix,
-        "inspect": cmd_inspect,
-        "heroes":  cmd_heroes,
-        "deck-lab": cmd_deck_lab,
+        "matrix":       cmd_matrix,
+        "inspect":      cmd_inspect,
+        "heroes":       cmd_heroes,
+        "deck-lab":     cmd_deck_lab,
     }
     dispatch[args.command](args)
 

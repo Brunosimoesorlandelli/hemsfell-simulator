@@ -281,7 +281,7 @@ def train_policy(
                 if best_eval is None or snapshot["global_delta_pp"] > best_eval["global_delta_pp"]:
                     best_eval = snapshot
                     best_checkpoint_tag = f"ep{ep+1}_{int(time.time())}"
-                    best_path = os.path.splitext(policy_path)[0] + "_best.pt"
+                    best_path = os.path.splitext(policy_path)[0] + "_best.json"
                     policy.save(
                         best_path,
                         metadata={
@@ -329,7 +329,7 @@ def train_policy(
         "best_checkpoint_tag": best_checkpoint_tag,
     }
     if save_best:
-        best_path = os.path.splitext(policy_path)[0] + "_best.pt"
+        best_path = os.path.splitext(policy_path)[0] + "_best.json"
         if not os.path.exists(best_path):
             fallback_tag = best_checkpoint_tag or "fallback_final"
             policy.save(

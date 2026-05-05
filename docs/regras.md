@@ -18,6 +18,7 @@ Reduzir a vida do herói adversário a 0, ou esgotar o deck do oponente.
    - Declare seus atacantes
    - O oponente declara bloqueadores
    - Resolução simultânea (exceto Veloz)
+   - Feitiços acelerados podem ser jogados neste turno também.
 
 4. **Fim de turno**
    - Energia não gasta vira **reserva** (máx. 3)
@@ -31,19 +32,19 @@ Reduzir a vida do herói adversário a 0, ou esgotar o deck do oponente.
 
 ## Energia
 
-- Começa em 1, aumenta 1 por turno (máx. 10)
+- Começa em 1, aumenta a depender da escolha da manutenção e efeitos de cartas. (máx. 10)
 - Pode ser acumulada como **reserva** (máx. 3 pontos)
-- Reserva é gasta junto com a energia corrente
+- Energia na Reserva só pode ser gasta com feitiços, artefatos, encantos.
 
 ## Nível do herói
 
 - Heróis começam no nível 1 e podem chegar ao nível 3
 - Custo: nível 2 = 2 energia, nível 3 = 3 energia
 - Cada herói tem sua condição específica de level up
+- O herói só pode aumentar 1 nivel por turno, ou seja, não pode ser possivel ir do nivel 1 ao 3 no mesmo turno.
 
 ## Condições especiais de vitória
 
 - Vida do oponente ≤ 0
 - Deck do oponente vazio no início do turno
-- **Colecionador**: 20 cartas na mão (nível 1) ou 25 (nível 2+)
 - **Campeão de Natureza**: qualquer carta com 50 marcadores (nível 3)

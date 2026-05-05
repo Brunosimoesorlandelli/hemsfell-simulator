@@ -38,7 +38,7 @@ def run_matchup(
     p1_name = f"J1 ({names.get(hero1_id, hero1_id)})"
     p2_name = f"J2 ({names.get(hero2_id, hero2_id)})"
     stats   = Stats(hero1_id, hero2_id)
-    policy = DQNPolicy.load(rl_policy_path, 25) if rl_policy_path else None
+    policy = DQNPolicy.load(rl_policy_path) if rl_policy_path else None
 
     for g in range(n_games):
         logger.clear()
@@ -62,7 +62,6 @@ def run_matchup(
                 training=False,
                 epsilon=0.0,
                 alpha=0.0,
-                reward_profile="v2_winrate",
             )
         result = gs.run()
         stats.add(result)

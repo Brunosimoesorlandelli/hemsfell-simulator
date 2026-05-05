@@ -12,8 +12,7 @@
 | **Robusto**      | Reduz em 1 todo dano recebido (mínimo 0) |
 | **Indomável**    | É obrigada a atacar; não pode bloquear |
 | **Indestrutível**| Não pode ser destruída (mas pode ser banida, exilada etc.) |
-| **Barreira Mágica** | Ignora o próximo efeito de feitiço ou habilidade que a alvejaria |
-| **Defensor**     | Recebe bônus de vitalidade (valor indicado na carta) |
+| **Barreira Mágica** | Não pode ser escolhida como alvo de efeito de feitiço ou habilidade. Mas pode ser afetado por efeitos em area, por exemplo. |
 | **Alerta**       | Pode atacar sem virar (não consome o "tap") |
 | **Acelerado**    | Feitiço pode ser jogado fora do seu turno como reação |
 | **Sufocado**     | Todos os efeitos e keywords da criatura ficam inativos |

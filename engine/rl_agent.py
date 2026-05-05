@@ -433,8 +433,13 @@ class MLPPolicy:
         pol = cls()
         if not os.path.exists(path):
             return pol
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            print(f"[RL] Aviso: arquivo de politica '{path}' invalido ou em formato "
+                  f"antigo (binario/corrompido). Iniciando politica do zero.")
+            return pol
         version = data.get("version", 1)
         if version < 3:
             # Arquivo antigo (LinearPolicy): descarta pesos incompatíveis.
@@ -447,8 +452,9 @@ class MLPPolicy:
         return pol
 
 
-# Alias para compatibilidade com código que instancie LinearPolicy diretamente.
+# Aliases para compatibilidade com código que instancie as classes diretamente.
 LinearPolicy = MLPPolicy
+DQNPolicy    = MLPPolicy
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -498,7 +504,16 @@ class RLEpisodeRuntime:
 
     # Contador global de decisoes no episodio (por jogador).
     # Garante ordenacao cronologica correta em on_game_end.
-    _decision_counter: dict[int, int] = field(default_factory=dict)
+    _decision_counter: dict[int, int]        = field(default_factory=dict)
+
+    # Ultimas features reais capturadas por jogador — usadas em
+    # record_invalid_action para evitar IndexError na MLP (o vetor precisa
+    # ter o mesmo n_in com que a rede foi inicializada).
+    _last_feats:       dict[int, dict]       = field(default_factory=dict)
+
+    # Contador de acoes invalidas no episodio — centralizado aqui para
+    # evitar o uso fragil de getattr(self, "_invalid_count", 0).
+    _invalid_count:    int                   = field(default=0)
 
     def _scope(self, player, kind: str) -> str:
         return f"{kind}:{player.hero.id}"
@@ -542,6 +557,7 @@ class RLEpisodeRuntime:
         action = self.policy.choose(scope, actions, feats,
                                     self.epsilon if self.training else 0.0)
         pid = id(player)
+        self._last_feats[pid] = feats   # salva para uso em record_invalid_action
         self.decisions[pid].append(
             _Decision(scope=scope, action=action, feats=feats,
                       episode_idx=self._next_idx(pid))
@@ -578,10 +594,18 @@ class RLEpisodeRuntime:
             return
         pid   = id(player)
         scope = self._scope(player, "main")
-        feats = {"bias": 1.0}
+        # Usa as ultimas features reais capturadas em decide_main_action.
+        # Evita IndexError causado por vetor de tamanho errado na MLP —
+        # o {"bias": 1.0} original tinha apenas 1 feature enquanto a rede
+        # espera n_in features (tipicamente 25).
+        feats = self._last_feats.get(pid)
+        if feats is None:
+            # Seguranca: se ainda nao houve nenhuma decisao neste turno,
+            # nao aplica penalidade para evitar inicializar a rede com
+            # dimensao errada.
+            return
         self.policy.update(scope, action, feats, -0.5, self.alpha)
-        # Incrementa contador para summarize()
-        self._invalid_count = getattr(self, "_invalid_count", 0) + 1
+        self._invalid_count += 1
 
     # ── Fim de turno: reward imediato ─────────────────────────────────────
 
@@ -716,7 +740,7 @@ class RLEpisodeRuntime:
         reward_avg = sum(all_rewards) / max(1, len(all_rewards))
 
         # Conta decisões inválidas registradas via record_invalid_action
-        invalid_count = getattr(self, "_invalid_count", 0)
+        invalid_count = self._invalid_count
         total_decisions = sum(
             len(dlist) for dlist in self.decisions.values()
         )

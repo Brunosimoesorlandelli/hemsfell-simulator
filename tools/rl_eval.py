@@ -168,15 +168,18 @@ def evaluate_policy(
         base_dmg_p2 = []
         rl_dmg_p2 = []
 
-        for seed_base in seed_list:
+        for s_idx, seed_base in enumerate(seed_list):
+            print(f"  seed {seed_base} ({s_idx+1}/{len(seed_list)}) base...", end="", flush=True)
             base = run_matchup(
                 h1, h2, games, data, card_pool, tags_db,
                 verbose=False, rl_policy_path=None, seed_base=seed_base,
             )
+            print(" rl...", end="", flush=True)
             rl = run_matchup(
                 h1, h2, games, data, card_pool, tags_db,
                 verbose=False, rl_policy_path=policy_path, seed_base=seed_base,
             )
+            print(" ok")
             mb = _metrics(base)
             mr = _metrics(rl)
             pair_base_wins += mb.p1_wins
