@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════╗
-║       HEMSFELL HEROES — MOTOR DE IA TÁTICA v1.0         ║
+║       HEMSFELL HEROES — MOTOR DE IA TÁTICA v2.0         ║
 ╚══════════════════════════════════════════════════════════╝
 
 Arquitetura:
@@ -8,7 +8,10 @@ Arquitetura:
   - Decisões com look-ahead de 1 turno
   - Bloqueio por troca favorável
   - Prioridade de ataque por keywords e situação
-  - Regras de sinergia por herói
+  - Sinergias por herói para criaturas, feitiços e permanentes
+  - Scoring contextual de board state (deficit/surplus)
+  - Sequenciamento intra-turno via played_this_turn
+  - Filtragem de alvos em feitiços de remoção
 """
 
 from __future__ import annotations
@@ -75,6 +78,18 @@ def analyze_opponent(opp: "Player") -> OpponentProfile:
     control = spell_density * 2.1 + removal_density * 2.6 + draw_tags * 0.08 + hero_control
     midrange = creature_density * 1.5 + big_body * 1.7 + avg_creature_cost * 0.28
 
+    # Correção: quando menos de 30% do deck foi revelado, suaviza o perfil
+    # em direção ao neutro para evitar decisões baseadas em amostra pequena.
+    revealed = (len(opp.hand) + len(opp.graveyard)
+                + len(opp.field_creatures) + len(opp.spells_field))
+    total_known = revealed + len(opp.deck)
+    reveal_ratio = revealed / max(1, total_known)
+    if reveal_ratio < 0.3:
+        blend    = reveal_ratio / 0.3
+        aggro    = aggro    * blend + 1.0 * (1 - blend)
+        control  = control  * blend + 1.0 * (1 - blend)
+        midrange = midrange * blend + 1.5 * (1 - blend)
+
     style = "midrange"
     best = max(aggro, control, midrange)
     if best == aggro:
@@ -93,32 +108,14 @@ def analyze_opponent(opp: "Player") -> OpponentProfile:
 
 
 # ─────────────────────────────────────────────────────────
-#  CACHE DE PERFIL DO OPONENTE (NEW v3)
+#  CACHE DE PERFIL DO OPONENTE
 # ─────────────────────────────────────────────────────────
-#
-# analyze_opponent() percorre todo o deck/mão/campo/cemitério — O(n) por
-# chamada. Como é invocado múltiplas vezes por fase (hand_card_score,
-# _spell_score, choose_attackers, choose_blockers...), o custo se acumula.
-#
-# Solução: cache por (id(opp), turno_chave) onde turno_chave combina o
-# tamanho dos conjuntos que mudam durante uma fase. O cache invalida
-# automaticamente quando o campo ou mão do oponente muda — sem estado
-# manual para limpar.
-#
-# Formato: {cache_key → OpponentProfile}
-# Cache é um dict simples limitado a 4 entradas para evitar crescimento
-# (no máximo 2 jogadores × 2 fases distintas por turno).
 
 _PROFILE_CACHE: dict = {}
 _PROFILE_CACHE_MAX = 4
 
 
 def _profile_cache_key(opp: "Player") -> tuple:
-    """
-    Chave de cache que invalida quando o estado observável do oponente muda.
-    Usa tamanhos dos conjuntos (field, hand, graveyard, spells_field) e o
-    hero.id — suficiente para detectar qualquer jogada ou destruição.
-    """
     return (
         id(opp),
         opp.hero.id,
@@ -131,18 +128,10 @@ def _profile_cache_key(opp: "Player") -> tuple:
 
 
 def get_opponent_profile(opp: "Player") -> OpponentProfile:
-    """
-    Versão cacheada de analyze_opponent().
-
-    Use esta função em todo o código que antes chamava analyze_opponent(opp)
-    diretamente — a interface é idêntica, mas evita recalcular O(n) quando
-    o estado do oponente não mudou desde a última chamada neste turno.
-    """
     global _PROFILE_CACHE
     key = _profile_cache_key(opp)
     if key in _PROFILE_CACHE:
         return _PROFILE_CACHE[key]
-    # Limpa cache se cresceu demais (LRU simples: descarta tudo)
     if len(_PROFILE_CACHE) >= _PROFILE_CACHE_MAX:
         _PROFILE_CACHE = {}
     profile = analyze_opponent(opp)
@@ -169,17 +158,35 @@ def card_value(card: "CardInst", owner: "Player") -> float:
 
 def hand_card_score(card: "CardInst", owner: "Player",
                     opp: "Player", turn: int,
-                    profile: OpponentProfile | None = None) -> float:
+                    profile: OpponentProfile | None = None,
+                    played_this_turn: list | None = None) -> float:
     profile = profile or get_opponent_profile(opp)
+    played_this_turn = played_this_turn or []
+    played_types = {c.card_type for c in played_this_turn}
+
+    # ── Board state: urgência de popular ou não o campo ──
+    board_score = sum(card_value(c, owner) for c in owner.field_creatures)
+    opp_board_score = sum(card_value(c, opp) for c in opp.field_creatures)
+    board_deficit = opp_board_score - board_score  # positivo = oponente tem vantagem de board
 
     if card.card_type == "creature":
-        base = card_value(card, owner) - card.cost * 0.6
+        # Correção 1: penalty progressiva — cartas acima de custo 4 são
+        # descontadas mais fortemente para refletir o custo de oportunidade real.
+        cost_penalty = card.cost * 0.6 + max(0, card.cost - 4) * 0.4
+        base = card_value(card, owner) - cost_penalty
+
+        # Urgência de popular o board
+        if board_deficit > 4.0:
+            base += min(2.0, board_deficit * 0.2)
+
+        # Correção 2: bônus de campo vazio inversamente proporcional ao custo.
+        # Cartas baratas são mais incentivadas a estabelecer presença cedo.
         if owner.field_size() == 0:
-            base += 2.0
+            base += max(0.5, 2.0 - card.cost * 0.2)
         if owner.field_size() >= 4 and not card.has_kw("Investida"):
             base -= 1.5
+
         if profile.aggro_risk > profile.control_risk:
-            # Contra aggro, valoriza curva baixa e criaturas que seguram mesa.
             base += max(0.0, 3.0 - card.cost) * 0.9
             base += card.base_vit * 0.22
             base -= max(0.0, card.cost - 3.0) * 0.9
@@ -188,23 +195,34 @@ def hand_card_score(card: "CardInst", owner: "Player",
             if any(kw in card.keywords for kw in ("Robusto", "Defensor", "Roubo de Vida")):
                 base += 1.0
         elif profile.control_risk > profile.aggro_risk:
-            # Contra controle, valoriza pressão recorrente/evasiva.
             if any(kw in card.keywords for kw in ("Furtivo", "Voar", "Investida")):
                 base += 1.5
             base += card.cost * 0.12
+
+        # Sequenciamento: se já jogou encanto/terreno este turno,
+        # criatura ganha bônus pois o campo já foi preparado
+        if "enchant" in played_types or "terrain" in played_types:
+            base += 0.5
+
         base += _hero_creature_bonus(card, owner)
         return base
 
     if card.card_type == "spell":
         if "Acelerado" in card.keywords:
             return -99.0
-        return _spell_score(card, owner, opp, profile)
+        score = _spell_score(card, owner, opp, profile)
+        score += _hero_spell_bonus(card, owner)
+        return score
 
     if card.card_type in ("enchant", "terrain"):
         ally_count = owner.field_size()
         score = 1.5 + ally_count * 0.4 - card.cost * 0.3
         if profile.control_risk > profile.aggro_risk:
             score += 0.5
+        # Se board está em déficit, permanentes de suporte valem menos agora
+        if board_deficit > 3.0 and ally_count == 0:
+            score -= 1.0
+        score += _hero_permanent_bonus(card, owner)
         return score
 
     if card.card_type == "artifact":
@@ -213,9 +231,36 @@ def hand_card_score(card: "CardInst", owner: "Player",
         score = 1.5 - card.cost * 0.2
         if profile.aggro_risk > profile.control_risk:
             score += 0.4
+        # Bônus se já jogou criatura este turno — slot garantido
+        if "creature" in played_types:
+            score += 0.8
+        score += _hero_permanent_bonus(card, owner)
         return score
 
     return 0.0
+
+
+def _matches_filter(card: "CardInst", filt: str) -> bool:
+    """Verifica se uma carta de campo passa por um filtro de efeito."""
+    if not filt:
+        return True
+    if "tapped" in filt:
+        return card.tapped
+    if "creature" in filt:
+        return card.card_type in ("creature", "image")
+    if "cost" in filt:
+        # ex: "cost<=3"
+        try:
+            op = "<=" if "<=" in filt else (">=" if ">=" in filt else "==")
+            val = int(filt.split(op)[-1])
+            if op == "<=":
+                return card.cost <= val
+            if op == ">=":
+                return card.cost >= val
+            return card.cost == val
+        except (ValueError, IndexError):
+            return True
+    return True
 
 
 def _spell_score(card: "CardInst", owner: "Player", opp: "Player",
@@ -227,6 +272,7 @@ def _spell_score(card: "CardInst", owner: "Player", opp: "Player",
     for tag in tags:
         action = tag.get("action", "")
         target = tag.get("target", "")
+        filt   = tag.get("filter", "")
 
         if action == "deal_damage":
             val = _resolve_value(tag.get("value", 1), owner)
@@ -246,13 +292,22 @@ def _spell_score(card: "CardInst", owner: "Player", opp: "Player",
                 score += 0.6
 
         elif action == "destroy":
-            if opp.field_creatures:
-                score += max(card_value(c, opp) for c in opp.field_creatures) * 0.9
+            # Considera o alvo específico no campo do oponente
+            targets = [c for c in opp.field_creatures if _matches_filter(c, filt)]
+            if targets:
+                best_target = max(targets, key=lambda c: card_value(c, opp))
+                score += card_value(best_target, opp) * 0.9
+                # Bônus extra se remove a maior ameaça de dano
+                if best_target.cur_off() >= owner.life * 0.3:
+                    score += 2.0
             score += 0.7 * profile.board_risk
 
         elif action == "buff":
             if owner.field_creatures:
                 score += 1.8
+                # Buff vale mais se já há criaturas com Investida no campo
+                if any(c.has_kw("Investida") for c in owner.field_creatures):
+                    score += 0.8
 
         elif action == "revive":
             creatures = [c for c in owner.graveyard if c.card_type == "creature"]
@@ -274,6 +329,15 @@ def _spell_score(card: "CardInst", owner: "Player", opp: "Player",
         elif action in ("search", "search_graveyard"):
             score += 2.0
 
+        elif action == "return_hand":
+            if opp.field_creatures:
+                best = max(opp.field_creatures, key=lambda c: card_value(c, opp))
+                score += card_value(best, opp) * 0.7
+
+        elif action == "apply_status":
+            if opp.field_creatures:
+                score += 1.5
+
     score -= card.cost * 0.3
     return score
 
@@ -285,6 +349,10 @@ def _resolve_value(value, owner: "Player") -> float:
         return float(len(owner.hand))
     return 1.0
 
+
+# ─────────────────────────────────────────────────────────
+#  SINERGIAS POR HERÓI
+# ─────────────────────────────────────────────────────────
 
 def _hero_creature_bonus(card: "CardInst", owner: "Player") -> float:
     hid  = owner.hero.id
@@ -338,6 +406,110 @@ def _hero_creature_bonus(card: "CardInst", owner: "Player") -> float:
         if "investig" in card.effect.lower():
             return 1.5
 
+    if hid == "hero_uruk":
+        # Uruk valoriza criaturas grandes e com keywords de combate
+        if card.base_off + card.base_vit >= 6:
+            return 1.0
+        if any(kw in card.keywords for kw in ("Atropelar", "Indomavel", "Veloz")):
+            return 0.8
+
+    if hid == "hero_lider_revolucionario":
+        # Lider valoriza criaturas de baixo custo para inundar o campo
+        if card.cost <= 2:
+            return 1.2
+        if card.cost <= 3 and owner.field_size() >= 3:
+            return 0.8
+
+    if hid == "hero_campeao_natureza":
+        # Campeão valoriza criaturas com markers ou que ganham counters
+        if "+1/+1" in card.effect or "marcador" in card.effect.lower():
+            return 1.5
+
+    return 0.0
+
+
+def _hero_spell_bonus(card: "CardInst", owner: "Player") -> float:
+    """Bônus de score para feitiços baseado na sinergia com o herói."""
+    hid = owner.hero.id
+
+    if hid == "hero_quarion":
+        # Quarion se beneficia de feitiços para copiar — qualquer feitiço tem valor extra
+        return 1.5
+
+    if hid == "hero_ngoro":
+        if "investig" in card.effect.lower():
+            return 2.0
+        # Ngoro aprecia compra de cartas para acumular pistas
+        for tag in card.effect_tags:
+            if tag.get("action") in ("draw", "search"):
+                return 1.2
+
+    if hid == "hero_tifon":
+        # Tifon não tem sinergia natural com feitiços genéricos
+        # mas valoriza feitiços que matam criaturas (triggam Suspiro dos aliados)
+        for tag in card.effect_tags:
+            if tag.get("action") in ("destroy", "deal_damage"):
+                if tag.get("target", "") and "enemy" in tag.get("target", ""):
+                    return 1.0
+        return -0.2
+
+    if hid == "hero_rasmus":
+        # Rasmus valoriza feitiços de café (geram reserva)
+        if "cafe" in card.name.lower():
+            return 2.0
+
+    if hid == "hero_campeao_natureza":
+        # Feitiços que dão buff a criaturas são o core do Campeão
+        for tag in card.effect_tags:
+            if tag.get("action") == "buff":
+                return 2.0
+
+    if hid == "hero_lider_revolucionario":
+        # Feitiços que compram cartas para manter o ritmo de recrutas
+        for tag in card.effect_tags:
+            if tag.get("action") in ("draw", "search"):
+                return 1.0
+
+    return 0.0
+
+
+def _hero_permanent_bonus(card: "CardInst", owner: "Player") -> float:
+    """Bônus de score para encantos, terrenos e artefatos baseado no herói."""
+    hid = owner.hero.id
+
+    if hid == "hero_ngoro":
+        # Base de Investigação e similares são centrais para o Ngoro
+        if "investig" in card.name.lower() or "investig" in card.effect.lower():
+            return 2.5
+
+    if hid == "hero_gimble":
+        # Artefatos e encantos que buffam dragões
+        if "dragao" in card.effect.lower() or "dragon" in card.effect.lower():
+            return 2.0
+
+    if hid == "hero_colecionador":
+        # Colecionador se beneficia de qualquer permanente que gere card advantage
+        for tag in card.effect_tags:
+            if tag.get("action") in ("draw", "search"):
+                return 1.5
+
+    if hid == "hero_campeao_natureza":
+        # Terrenos e encantos que colocam marcadores
+        if "marcador" in card.effect.lower() or "+1/+1" in card.effect:
+            return 2.0
+
+    if hid == "hero_rasmus":
+        # Artefatos e encantos de café
+        if "cafe" in card.name.lower():
+            return 2.5
+
+    if hid == "hero_uruk":
+        # Artefatos de combate têm valor extra para Uruk
+        if card.card_type == "artifact":
+            for tag in card.effect_tags:
+                if tag.get("action") in ("buff", "deal_damage"):
+                    return 1.2
+
     return 0.0
 
 
@@ -346,43 +518,29 @@ def _hero_creature_bonus(card: "CardInst", owner: "Player") -> float:
 # ─────────────────────────────────────────────────────────
 
 def _choose_maintenance_action(player: "Player", opp: "Player") -> str:
-    """
-    Decide entre as duas opções da etapa de manutenção:
-      'energy' → +1 energia máxima E compra 1 carta
-      'draw'   → compra 2 cartas
-
-    Regra: primeiro turno DEVE escolher energia (max_energy começa em 0).
-    """
-    # Obrigatório: primeiro turno ou energia zero → pega energia
     if player.max_energy == 0:
         return "energy"
-    # Já na energia máxima → compra 2 (não há ganho em pegar mais energia)
     if player.max_energy >= MAX_ENERGY:
         return "draw"
 
     next_energy = player.max_energy + 1
     hand_size   = len(player.hand)
 
-    # Tem carta cara na mão que ficará jogável exatamente com +1 energia?
     has_key_card = any(
         c.cost == next_energy
         for c in player.hand
         if "Acelerado" not in c.keywords
     )
 
-    # Mão muito pequena → card advantage é mais urgente que energia
     if hand_size <= 2 and player.max_energy >= 4:
         return "draw"
 
-    # Board vazio + mão baixa → pode precisar de mais opções agora
     if player.field_size() == 0 and hand_size <= 3 and player.max_energy >= 5:
         return "draw"
 
-    # Abaixo de 7 de energia → crescimento de ramp quase sempre compensa
     if player.max_energy < 7:
         return "energy"
 
-    # Entre 7–9: pega energia somente se tiver carta que se beneficia
     return "energy" if has_key_card else "draw"
 
 
@@ -391,17 +549,12 @@ def _choose_maintenance_action(player: "Player", opp: "Player") -> str:
 # ─────────────────────────────────────────────────────────
 
 def _get_defensor_x(card: "CardInst") -> int:
-    """
-    Retorna X do keyword 'Defensor X'.
-    Regra: Defensor X permite que 1 criatura bloqueie X criaturas atacantes.
-    Retorna 0 se a criatura não tem Defensor.
-    """
     for kw in card.keywords:
         if kw == "Defensor" or kw.startswith("Defensor "):
             parts = kw.split()
             if len(parts) > 1 and parts[1].isdigit():
                 return int(parts[1])
-            return 1  # "Defensor" sem número = bloqueia 1 (comportamento padrão)
+            return 1
     return 0
 
 
@@ -410,8 +563,11 @@ def _get_defensor_x(card: "CardInst") -> int:
 # ─────────────────────────────────────────────────────────
 
 def choose_card_to_play(player: "Player", opp: "Player",
-                        turn: int, excluded_iids: set[int] | None = None) -> Optional["CardInst"]:
-    excluded_iids = excluded_iids or set()
+                        turn: int,
+                        excluded_iids: set[int] | None = None,
+                        played_this_turn: list | None = None) -> Optional["CardInst"]:
+    excluded_iids    = excluded_iids or set()
+    played_this_turn = played_this_turn or []
     profile = get_opponent_profile(opp)
     cost_red = getattr(player, "_cost_reduction_next", 0)
     playable = []
@@ -420,8 +576,6 @@ def choose_card_to_play(player: "Player", opp: "Player",
         if card.iid in excluded_iids:
             continue
         cost = max(0, card.cost - cost_red)
-        # Regra: reserva só pode ser usada para feitiços.
-        # Criaturas, encantos, terrenos e artefatos só usam energia regular.
         avail = player.total_energy() if card.card_type == "spell" else player.energy
         if cost > avail:
             continue
@@ -437,7 +591,7 @@ def choose_card_to_play(player: "Player", opp: "Player",
             if not has_slot:
                 continue
 
-        score = hand_card_score(card, player, opp, turn, profile)
+        score = hand_card_score(card, player, opp, turn, profile, played_this_turn)
         playable.append((score, card))
 
     if not playable:
@@ -463,7 +617,7 @@ def choose_artifact_slot(player: "Player") -> Optional[int]:
 def _play_order_priority(card: "CardInst", player: "Player") -> int:
     """
     Retorna prioridade de jogo (menor = jogar primeiro).
-    Garante sequenciamento correto: terrenos → encantos → feitiços de dano/remoção
+    Garante sequenciamento correto: terrenos → encantos → feitiços de remoção
     → feitiços de buff → criaturas normais → criaturas com Investida → artefatos.
     """
     if card.card_type == "terrain":
@@ -474,64 +628,15 @@ def _play_order_priority(card: "CardInst", player: "Player") -> int:
         for tag in card.effect_tags:
             action = tag.get("action", "")
             if action == "buff":
-                return 3  # Buff de aliados: depois de ter criaturas no campo
-        return 2  # Dano, remoção, compra: antes de invocar criaturas
+                return 3
+        return 2
     if card.card_type == "creature":
         if card.has_kw("Investida"):
-            return 5  # Investida ataca este turno: invoca por último
+            return 5
         return 4
     if card.card_type == "artifact":
-        return 6  # Artefatos precisam de criaturas: sempre últimos
+        return 6
     return 4
-
-
-def choose_best_play_sequence(player: "Player", opp: "Player",
-                               turn: int) -> list["CardInst"]:
-    """
-    Retorna a melhor sequência ordenada de cartas a jogar neste turno,
-    considerando energia disponível e sequenciamento de triggers.
-    Util para análise externa; a fase principal usa choose_card_to_play + ordering.
-    """
-    from itertools import combinations as _combos
-
-    profile = get_opponent_profile(opp)
-    cost_red = getattr(player, "_cost_reduction_next", 0)
-    budget = player.total_energy()
-
-    playable = []
-    for c in player.hand:
-        if "Acelerado" in c.keywords:
-            continue
-        cost = max(0, c.cost - cost_red)
-        if cost > budget:
-            continue
-        if c.card_type == "creature" and player.field_size() >= 5:
-            continue
-        score = hand_card_score(c, player, opp, turn, profile)
-        if score > -0.5:
-            playable.append((cost, score, c))
-
-    if not playable:
-        return []
-
-    # Escolhe combinação de até 3 cartas com melhor score total dentro do orçamento
-    best_combo: list = []
-    best_score = -999.0
-
-    for r in range(1, min(4, len(playable) + 1)):
-        for combo in _combos(playable, r):
-            total_cost = sum(c[0] for c in combo)
-            if total_cost > budget:
-                continue
-            efficiency = total_cost / max(1, budget)
-            total_score = sum(c[1] for c in combo) * (0.85 + 0.15 * efficiency)
-            if total_score > best_score:
-                best_score = total_score
-                best_combo = [c[2] for c in combo]
-
-    # Ordena pela prioridade de jogo (terrenos/feitiços antes de criaturas)
-    best_combo.sort(key=lambda c: _play_order_priority(c, player))
-    return best_combo
 
 
 # ─────────────────────────────────────────────────────────
@@ -562,14 +667,12 @@ def can_deal_lethal(player: "Player", opp: "Player") -> bool:
     if not can_attack:
         return False
 
-    # Dano garantido de furtivos (inbloqueável)
     guaranteed_dmg = sum(c.cur_off() for c in can_attack if c.has_kw("Furtivo"))
     non_furtivo = [c for c in can_attack if not c.has_kw("Furtivo")]
 
     if not non_furtivo:
         return guaranteed_dmg >= opp.life
 
-    # Simula bloqueio otimista do oponente (pior caso para o atacante)
     opp_blockers = [b for b in opp.field_creatures if b.cur_vit() > 0]
     used_blockers: set[int] = set()
 
@@ -584,7 +687,6 @@ def can_deal_lethal(player: "Player", opp: "Player") -> bool:
             guaranteed_dmg += atk.cur_off()
             continue
 
-        # Oponente usa o bloqueador que mais preserva seu board
         def blocker_score(b, a=atk):
             outcome = _combat_outcome(a, b)
             s = 0.0
@@ -605,11 +707,9 @@ def can_deal_lethal(player: "Player", opp: "Player") -> bool:
 def _expected_attack_value(attacker: "CardInst", opp: "Player",
                             player: "Player") -> float:
     """Estima o valor líquido de enviar este atacante. Positivo = bom atacar."""
-    # Furtivo ou campo vazio: dano garantido
     if attacker.has_kw("Furtivo") or not opp.field_creatures:
         return attacker.cur_off() * AI_LIFE_VALUE + 0.3
 
-    # Voar sem resposta aérea: dano garantido
     if attacker.has_kw("Voar"):
         if not any(b.has_kw("Voar") for b in opp.field_creatures):
             return attacker.cur_off() * AI_LIFE_VALUE + 0.3
@@ -620,7 +720,6 @@ def _expected_attack_value(attacker: "CardInst", opp: "Player",
     if not valid_blockers:
         return attacker.cur_off() * AI_LIFE_VALUE + 0.2
 
-    # Pior caso: oponente escolhe o bloqueador mais prejudicial para nós
     worst_net = float('inf')
     worst_outcome = None
     for blk in valid_blockers:
@@ -635,7 +734,6 @@ def _expected_attack_value(attacker: "CardInst", opp: "Player",
             worst_net = net
             worst_outcome = outcome
 
-    # Bônus se no pior caso o atacante sobrevive (pressão contínua)
     if worst_outcome and not worst_outcome["atk_dies"]:
         worst_net += attacker.cur_off() * AI_LIFE_VALUE * 0.25
 
@@ -648,7 +746,6 @@ def choose_attackers(player: "Player", opp: "Player") -> list["CardInst"]:
     if not can_attack:
         return []
 
-    # Verificação de lethal: se pode matar o oponente, manda tudo
     if can_deal_lethal(player, opp):
         return can_attack
 
@@ -675,12 +772,10 @@ def choose_attackers(player: "Player", opp: "Player") -> list["CardInst"]:
         priority = _attacker_priority(c, opp)
         expected = _expected_attack_value(c, opp, player)
 
-        # Ataca se prioridade alta (evasão etc.) OU valor esperado positivo
         if priority >= 3.0 or expected > -0.2:
             chosen.append(c)
 
     if not chosen and can_attack:
-        # Fallback: envia o de maior valor esperado que não piore muito
         best = max(can_attack,
                    key=lambda c: (_expected_attack_value(c, opp, player), c.cur_off()))
         if best.cur_off() > 0 and _expected_attack_value(best, opp, player) > -1.0:
@@ -692,7 +787,6 @@ def choose_attackers(player: "Player", opp: "Player") -> list["CardInst"]:
 def _how_many_defenders_needed(player: "Player", opp: "Player",
                                profile: OpponentProfile | None = None) -> int:
     profile = profile or get_opponent_profile(opp)
-    # Criaturas do oponente que podem atacar no próximo turno
     opp_potential = [c for c in opp.field_creatures
                      if (not c.tapped or c.has_kw("Alerta"))
                      and (not c.sick or c.has_kw("Investida"))]
@@ -701,7 +795,6 @@ def _how_many_defenders_needed(player: "Player", opp: "Player",
 
     player_has_flyers = any(c.has_kw("Voar") for c in player.field_creatures)
 
-    # Dano inbloqueável: Furtivo + Voar sem resposta aérea
     unblockable_dmg = sum(c.cur_off() for c in opp_potential
                           if c.has_kw("Furtivo"))
     if not player_has_flyers:
@@ -716,15 +809,12 @@ def _how_many_defenders_needed(player: "Player", opp: "Player",
 
     safety_margin = 6 if profile.aggro_risk <= profile.control_risk else 9
 
-    # Se o dano inbloqueável já é crítico, não adianta reservar defensores
     if player.life - unblockable_dmg <= 3:
         return 0
 
-    # Está seguro mesmo sem bloquear nada
     if player.life > total_dmg + safety_margin:
         return 0
 
-    # Reserva defensores para as maiores ameaças bloqueáveis
     dangerous = sorted(blockable, key=lambda c: c.cur_off(), reverse=True)
     reserve = 3 if profile.aggro_risk > profile.control_risk else 2
     return min(len(dangerous), reserve)
@@ -761,7 +851,7 @@ def _combat_outcome(atk: "CardInst", blk: "CardInst") -> dict:
 
     excess = 0
     if blk_dies and atk.has_kw("Atropelar"):
-        excess = max(0, a_dmg - blk.base_vit)
+        excess = max(0, a_dmg - blk.cur_vit())
 
     return {"atk_dies": atk_dies, "blk_dies": blk_dies, "excess": excess}
 
@@ -803,24 +893,13 @@ def _block_trade_score(atk: "CardInst", blk: "CardInst",
 def choose_blockers(attackers: list["CardInst"],
                     defender: "Player",
                     attacker_player: "Player") -> dict[int, list["CardInst"]]:
-    """
-    Retorna dict {atk.iid: [lista de bloqueadores]}.
-    Lista vazia = não bloqueado.
-
-    Regra: 1 criatura bloqueia 1 atacante.
-    Exceção — Defensor X: 1 criatura pode bloquear até X atacantes diferentes
-    (o mesmo objeto bloqueador aparece em múltiplas entradas do dict).
-    """
-    profile = analyze_opponent(attacker_player)
+    profile = get_opponent_profile(attacker_player)
     blocks: dict[int, list] = {}
 
-    # Furtivos são inbloqueáveis
     for atk in attackers:
         if atk.has_kw("Furtivo"):
             blocks[atk.iid] = []
 
-    # Rastreia slots restantes de bloqueio por criatura
-    # Criaturas normais: 1 slot. Defensor X: X slots.
     block_slots: dict[int, int] = {}
     for c in defender.field_creatures:
         if c.can_block():
@@ -828,7 +907,6 @@ def choose_blockers(attackers: list["CardInst"],
             block_slots[c.iid] = dx if dx > 0 else 1
 
     def avail_blockers(atk):
-        """Retorna bloqueadores ainda disponíveis para este atacante."""
         return [
             c for c in defender.field_creatures
             if c.can_block()
@@ -853,7 +931,6 @@ def choose_blockers(attackers: list["CardInst"],
             blocks[atk.iid] = [best_blocker]
             block_slots[best_blocker.iid] -= 1
         else:
-            # Chump block de emergência: verifica se sem este bloqueio morremos
             total_unblocked = sum(
                 a.cur_off() for a in need_block
                 if a.iid not in blocks or not blocks.get(a.iid)
@@ -973,21 +1050,15 @@ def evaluate_state(player: "Player", opp: "Player") -> float:
     hand_adv   = (len(player.hand) - len(opp.hand)) * 0.5
     energy_adv = (player.total_energy() - opp.total_energy()) * 0.3
     level_adv  = (player.hero_level - opp.hero_level) * 2.0
-
-    # Progresso rumo ao próximo level up
     levelup_adv = player.levelup_counter * 0.08 - opp.levelup_counter * 0.08
 
-    # Pressão de deck (deck pequeno = perigo iminente de derrota)
     deck_adv = 0.0
     if len(opp.deck) < 5:
         deck_adv += (5 - len(opp.deck)) * 1.5
     if len(player.deck) < 5:
         deck_adv -= (5 - len(player.deck)) * 1.5
 
-    # Permanentes no campo (encantos, terrenos, artefatos) geram vantagem contínua
     perm_adv = (len(player.spells_field) - len(opp.spells_field)) * 0.8
-
-    # Pistas acumuladas (relevante para Ngoro)
     pistas_adv = (player.pistas - opp.pistas) * 0.3
 
     return ((ally_field - opp_field) + life_adv + hand_adv +

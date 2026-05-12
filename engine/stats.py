@@ -84,13 +84,22 @@ class Stats:
         return "\n".join(lines)
 
 
-def save_report(reports: list[str], path: str):
+def save_report(reports: list[str], path: str, append: bool = False):
+    """Salva o relatório de stats no arquivo.
+    Se append=True, adiciona ao final (usado quando logs de turno já foram escritos).
+    """
     import os
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("HEMSFELL HEROES — RELATÓRIO DE SIMULAÇÕES\n")
-        f.write(f"Gerado em: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write("=" * 64 + "\n\n")
+    mode = "a" if append else "w"
+    with open(path, mode, encoding="utf-8") as f:
+        if not append:
+            f.write("HEMSFELL HEROES — RELATÓRIO DE SIMULAÇÕES\n")
+            f.write(f"Gerado em: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("=" * 64 + "\n\n")
+        else:
+            f.write("\n" + "═" * 64 + "\n")
+            f.write("  RELATÓRIO AGREGADO\n")
+            f.write("═" * 64 + "\n\n")
         for r in reports:
             f.write(r + "\n\n")
     print(f"\n📄 Relatório salvo em: {path}")

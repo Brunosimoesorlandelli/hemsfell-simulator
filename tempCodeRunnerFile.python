@@ -1,0 +1,18 @@
+import json
+with open("reports/rl_policy.json") as f:
+    data = json.load(f)
+
+heroes = set()
+for k in data["nets"]:
+    scope, action = k.split("|")
+    heroes.add(scope)
+
+for scope in sorted(heroes):
+    actions = {}
+    for k, net in data["nets"].items():
+        s, a = k.split("|")
+        if s == scope:
+            actions[a] = net["b3"]
+    print(f"\n{scope}:")
+    for a, b3 in sorted(actions.items(), key=lambda x: -x[1]):
+        print(f"  {a:30s} b3={b3:8.2f}")

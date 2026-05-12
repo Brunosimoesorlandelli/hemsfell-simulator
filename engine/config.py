@@ -12,14 +12,14 @@ MAX_ENERGY      = 10    # energia máxima por turno
 MAX_RESERVE     = 3     # energia reserva máxima
 STARTING_LIFE   = 30    # vida inicial de cada jogador
 STARTING_HAND   = 7     # cartas na mão inicial
-MAX_TURNS       = 40    # limite de turnos antes de empate
+MAX_TURNS       = 100    # limite de turnos antes de empate
 
 # ── Level up ──────────────────────────────────────────────────────────────
 LEVELUP_COST = {2: 2, 3: 3}   # custo em energia para subir de nível
 
 # ── IA ────────────────────────────────────────────────────────────────────
 # Valores usados pela ai_engine na avaliação de cartas/estado
-AI_LIFE_VALUE          = 0.8    # quanto vale 1 ponto de vida do herói
+AI_LIFE_VALUE          = 1    # quanto vale 1 ponto de vida do herói
 AI_HIGH_COST_PENALTY   = 0.5    # penalidade por custo alto sem campo desenvolvido
 
 # Bônus por keyword na avaliação de carta em campo

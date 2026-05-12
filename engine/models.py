@@ -313,4 +313,5 @@ class Player:
         self.milled_this_turn = 0
         self.first_acts_triggered = 0
         self.leveled_up_this_turn = False
+        self._cost_reduction_next = 0   # reset desconto de custo entre turnos
         self.life_min = min(self.life_min, self.life)

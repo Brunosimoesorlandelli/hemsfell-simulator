@@ -1,7 +1,8 @@
 """
-Hemsfell Heroes — Simulador v2.2
+Hemsfell Heroes — Simulador v3.0
 ==================================
 GameState: orquestra as fases do jogo e usa os módulos especializados.
+IA totalmente heurística — sem dependência de aprendizado por reforço.
 """
 
 from __future__ import annotations
@@ -16,6 +17,131 @@ from . import ai_engine as AI
 
 
 # ─────────────────────────────────────────────
+#  PILHA DE EFEITOS (FIFO)
+# ─────────────────────────────────────────────
+class EffectStack:
+    """
+    Rastreia a cadeia de efeitos acionados durante um turno.
+    Segue lógica FIFO: o primeiro efeito adicionado é o primeiro resolvido/exibido.
+    """
+    def __init__(self):
+        self._queue: list[dict] = []
+        self._depth: int = 0          # profundidade de aninhamento atual
+        self._active: bool = False    # True enquanto uma cadeia está em andamento
+
+    def push(self, trigger: str, source_name: str, detail: str = ""):
+        """Registra um efeito na fila antes de ser resolvido."""
+        entry = {
+            "trigger": trigger,
+            "source":  source_name,
+            "detail":  detail,
+            "depth":   self._depth,
+        }
+        self._queue.append(entry)
+        self._active = True
+
+    def begin_resolve(self):
+        """Marca que o próximo efeito da fila começa a resolver (incrementa profundidade)."""
+        self._depth += 1
+
+    def end_resolve(self):
+        """Marca que o efeito resolveu (decrementa profundidade)."""
+        self._depth = max(0, self._depth - 1)
+
+    def flush_log(self):
+        """Imprime a cadeia de efeitos acumulada e limpa a fila."""
+        if not self._queue:
+            return
+        log("📚 CADEIA DE EFEITOS (ordem de resolução):", 2)
+        for i, entry in enumerate(self._queue):
+            indent = "   " * entry["depth"]
+            arrow  = "└─" if entry["depth"] > 0 else "├─"
+            detail_str = f" → {entry['detail']}" if entry["detail"] else ""
+            log(f"{indent}{arrow} [{i+1}] {entry['trigger'].upper()} "
+                f"| {entry['source']}{detail_str}", 2)
+        self._queue.clear()
+        self._depth = 0
+        self._active = False
+
+    def reset(self):
+        self._queue.clear()
+        self._depth = 0
+        self._active = False
+
+
+def _log_hand(player, label: str = ""):
+    """Loga as cartas na mão do jogador com custo e tipo."""
+    if not player.hand:
+        log(f"🤚 Mão de {player.name}{' ' + label if label else ''}: [vazia]", 2)
+        return
+    cards_str = ", ".join(
+        f"{c.name}({c.card_type[0].upper()}{c.cost})"
+        for c in player.hand
+    )
+    log(f"🤚 Mão de {player.name}{' ' + label if label else ''} "
+        f"[{len(player.hand)} carta(s)]: {cards_str}", 2)
+
+
+def _log_play_reason(card, player, opp, turn: int):
+    """
+    Loga o critério de escolha da carta jogada pela IA.
+    Analisa heurísticas para explicar a decisão de forma legível.
+    """
+    reasons = []
+
+    # Pressão de campo
+    field_diff = player.field_size() - opp.field_size()
+    if card.card_type == "creature":
+        if field_diff < 0:
+            reasons.append(f"campo desfavorável ({player.field_size()} vs {opp.field_size()}) — precisa de criaturas")
+        elif field_diff == 0:
+            reasons.append("campo equilibrado — expande presença")
+        else:
+            reasons.append(f"campo dominante ({player.field_size()} vs {opp.field_size()}) — mantém pressão")
+
+        # Stat relevante da criatura
+        reasons.append(f"stats {card.cur_off()}/{card.cur_vit()} por {card.cost} de energia")
+
+        # Keywords relevantes
+        kws = [k for k in (card.keywords or [])
+               if k in ("Veloz", "Voar", "Toque da Morte", "Furtivo", "Atropelar", "Roubo de Vida")]
+        if kws:
+            reasons.append(f"possui: {', '.join(kws)}")
+
+    elif card.card_type == "spell":
+        actions = {t.get("action", "") for t in (card.effect_tags or [])}
+        if "destroy" in actions:
+            enemy_count = len(opp.field_creatures)
+            reasons.append(f"remoção — oponente tem {enemy_count} criatura(s) em campo")
+        if "deal_damage" in actions:
+            reasons.append("dano direto")
+        if "draw" in actions:
+            reasons.append(f"compra de cartas — mão com {len(player.hand)} carta(s)")
+        if not reasons:
+            reasons.append("feitiço de suporte")
+
+    elif card.card_type in ("enchant", "terrain"):
+        reasons.append("efeito persistente de campo")
+
+    elif card.card_type == "artifact":
+        reasons.append("artefato de suporte")
+
+    # Vida baixa do oponente
+    if opp.life <= 8:
+        reasons.append(f"⚠️  oponente com vida baixa ({opp.life}) — buscando lethal")
+
+    # Custo vs energia disponível
+    energy_left = player.total_energy() - card.cost
+    if energy_left == 0:
+        reasons.append("usa toda a energia disponível")
+    elif energy_left <= 1:
+        reasons.append(f"aproveita energia (sobra {energy_left})")
+
+    reason_str = " | ".join(reasons) if reasons else "escolha geral da IA"
+    log(f"   🧠 Critério: {reason_str}", 2)
+
+
+# ─────────────────────────────────────────────
 #  GAMESTATE
 # ─────────────────────────────────────────────
 class GameState:
@@ -26,7 +152,7 @@ class GameState:
         self.card_pool = card_pool
         self.tags_db   = tags_db
         self.engine    = EffectEngine(self)
-        self.rl_runtime = None
+        self.effect_stack = EffectStack()
 
     def opponent(self, p: Player) -> Player:
         return self.players[1] if p is self.players[0] else self.players[0]
@@ -48,25 +174,54 @@ class GameState:
         log(f"💀 '{card.name}' destruída ({owner.name})", 2)
 
         double = getattr(owner, "_double_last_breath", False)
+
+        # ── Registra last_breath na pilha ────────────────────────────────
+        if card.effect_tags:
+            lb_tags = [t for t in card.effect_tags
+                       if t.get("trigger") == "last_breath" or "last_breath" in str(t)]
+            if lb_tags or any("last_breath" in str(t) for t in card.effect_tags):
+                count = 2 if double else 1
+                for _ in range(count):
+                    self.effect_stack.push(
+                        "Último Suspiro",
+                        card.name,
+                        f"{'(x2 — double last breath) ' if double else ''}acionado pela morte"
+                    )
+
+        self.effect_stack.begin_resolve()
         for _ in range(2 if double else 1):
             self.engine.resolve_tags(card, "last_breath", owner)
+        self.effect_stack.end_resolve()
 
         owner.graveyard.append(card)
 
+        # ── Registra on_death_ally na pilha ──────────────────────────────
+        for c in list(owner.field_creatures):
+            ally_tags = [t for t in (c.effect_tags or [])
+                         if t.get("trigger") == "on_death_ally"]
+            if ally_tags:
+                self.effect_stack.push(
+                    "Morte de Aliado",
+                    c.name,
+                    f"aliado '{card.name}' morreu"
+                )
+
+        self.effect_stack.begin_resolve()
         for c in list(owner.field_creatures):
             self.engine.resolve_tags(c, "on_death_ally", owner, {"dead": card})
         for enc in owner.spells_field:
             self.engine.resolve_tags(enc, "on_death_ally", owner, {"dead": card})
         self.engine.resolve_tags(owner.hero, "on_death_ally", owner, {"dead": card})
+        self.effect_stack.end_resolve()
 
     # ── Verificação de vitória ────────────────────────────────────────────
     def check_victory(self) -> Optional[Player]:
         for p in self.players:
             if p.life <= 0:
                 return self.opponent(p)
-            if not p.deck and self.turn > 0:
+            if not p.deck and not p.hand and self.turn > 0:
                 return self.opponent(p)
-            if len(p.hand) >= 20 and "Colecionador" in p.hero.name:
+            if len(p.hand) >= 20 and p.hero.id == "hero_colecionador":
                 return p
         return None
 
@@ -92,7 +247,6 @@ class GameState:
                     c.status.remove(st)
 
         if first_turn:
-            # Primeiro turno: obrigatório pegar energia (regra: max_energy começa em 0)
             action = "energy"
         else:
             action = AI._choose_maintenance_action(player, opp)
@@ -116,7 +270,7 @@ class GameState:
                 player.heal(1)
                 log(f"🐉 Gimble Nv1: +1 vida ({player.life})", 2)
             if player.hero_level >= 3:
-                for c in player.field_creatures:
+                for c in list(player.field_creatures):
                     if "dragao" in c.race.lower() or "dragon" in c.race.lower():
                         c.add_marker("+1/+1", 1)
 
@@ -126,16 +280,12 @@ class GameState:
                 log(f"🃏 Goblin Nv2: extra '{drawn[0].name}'", 2)
 
         if player.hero.id == "hero_ngoro" and player.hero_level >= 1:
-            target_d = self.opponent(player) if random.random() > 0.5 else player
-            self.engine._investigate(target_d, 1, player)
+            self.engine._investigate(self.opponent(player), 1, player)
 
         self.engine.resolve_tags(player.hero, "start_of_turn", player)
-        for enc in player.spells_field:
+        for enc in list(player.spells_field):
             self.engine.resolve_tags(enc, "start_of_turn", player)
             self.engine.resolve_tags(enc, "start_of_turn_both", player)
-
-        if self.rl_runtime is not None:
-            self.rl_runtime.on_turn_start(self, player, opp)
 
     def phase_main(self, player: Player):
         log(f"\n⚙️  PRINCIPAL — {player.name}", 1)
@@ -144,123 +294,39 @@ class GameState:
         player.mana_budget_total += player.total_energy()
         player.max_energy_reached = max(player.max_energy_reached, player.max_energy)
 
+        # ── Log de mãos no início da fase principal ───────────────────────
+        _log_hand(player, "(sua vez)")
+        _log_hand(opp, "(oponente)")
+        self.effect_stack.reset()
+
         excluded_iids: set[int] = set()
-        played_any = False
+        played_this_turn: list[CardInst] = []
+        _loop_guard = 0
+
         while True:
+            _loop_guard += 1
+            if _loop_guard > 30:
+                break
+
             try_levelup_phase(player, self)
-            card = None
-            forced_pass = False
 
-            if self.rl_runtime is not None:
-                actions = []
-                cost_red = getattr(player, "_cost_reduction_next", 0)
-                can_levelup = (
-                    player.hero_level < 3
-                    and not player.leveled_up_this_turn
-                    and player.total_energy() >= LEVELUP_COST.get(player.hero_level + 1, 99)
-                )
-                if can_levelup:
-                    actions.append("levelup_if_possible")
+            card = AI.choose_card_to_play(
+                player, opp, self.turn,
+                excluded_iids=excluded_iids,
+                played_this_turn=played_this_turn,
+            )
+            if card is None:
+                break
 
-                can_play_creature = False
-                can_play_spell = False
-                can_play_artifact = False
-                for c in player.hand:
-                    if c.iid in excluded_iids:
-                        continue
-                    cost_preview = max(0, c.cost - cost_red)
-                    if c.card_type == "creature":
-                        if cost_preview <= player.energy and player.field_size() < MAX_CREATURES:
-                            can_play_creature = True
-                    elif c.card_type in ("spell", "enchant", "terrain"):
-                        if c.card_type == "spell":
-                            if "Acelerado" not in c.keywords and cost_preview <= player.total_energy() and self._spell_useful(c, player, opp):
-                                can_play_spell = True
-                        else:
-                            if cost_preview <= player.energy and self._spell_useful(c, player, opp):
-                                can_play_spell = True
-                    elif c.card_type == "artifact":
-                        if cost_preview <= player.energy and AI.choose_artifact_slot(player) is not None:
-                            can_play_artifact = True
-
-                if can_play_creature:
-                    actions.append("play_best_creature")
-                if can_play_spell:
-                    actions.append("play_best_spell")
-                if can_play_artifact:
-                    actions.append("play_best_artifact")
-                actions.append("pass")
-
-                action = self.rl_runtime.decide_main_action(self, player, opp, actions)
-                if action == "pass":
-                    break
-                if action == "levelup_if_possible":
-                    pre_lvl = player.hero_level
-                    try_levelup_phase(player, self)
-                    if player.hero_level == pre_lvl:
-                        excluded_iids.add(-1)
-                        self.rl_runtime.record_invalid_action(player, action)
-                    else:
-                        played_any = True
-                    continue
-
-                profile = AI.analyze_opponent(opp)
-                candidates = []
-                for c in player.hand:
-                    if c.iid in excluded_iids:
-                        continue
-                    cost_preview = max(0, c.cost - getattr(player, "_cost_reduction_next", 0))
-                    if action == "play_best_creature":
-                        if c.card_type != "creature":
-                            continue
-                        if cost_preview > player.energy or player.field_size() >= MAX_CREATURES:
-                            continue
-                        candidates.append(c)
-                    elif action == "play_best_spell":
-                        if c.card_type not in ("spell", "enchant", "terrain"):
-                            continue
-                        if c.card_type == "spell":
-                            if "Acelerado" in c.keywords:
-                                continue
-                            if cost_preview > player.total_energy():
-                                continue
-                        else:
-                            if cost_preview > player.energy:
-                                continue
-                        if self._spell_useful(c, player, opp):
-                            candidates.append(c)
-                    elif action == "play_best_artifact":
-                        if c.card_type != "artifact":
-                            continue
-                        if cost_preview > player.energy:
-                            continue
-                        if AI.choose_artifact_slot(player) is None:
-                            continue
-                        candidates.append(c)
-                if candidates:
-                    card = max(
-                        candidates,
-                        key=lambda c: AI.hand_card_score(c, player, opp, self.turn, profile),
-                    )
-                else:
-                    forced_pass = True
-                    self.rl_runtime.record_invalid_action(player, action)
-            else:
-                card = AI.choose_card_to_play(player, opp, self.turn, excluded_iids)
-                if card is None:
-                    break
-                if played_any and not AI.should_play_card_now(card, player, opp, self.turn):
-                    break
-
-            if forced_pass:
+            # Verifica se vale jogar agora ou segurar para o próximo turno
+            if played_this_turn and not AI.should_play_card_now(card, player, opp, self.turn):
                 break
 
             cost_red = getattr(player, "_cost_reduction_next", 0)
             cost = max(0, card.cost - cost_red)
-            # Regra: reserva só pode ser usada para feitiços.
-            # Criaturas, encantos, terrenos e artefatos usam apenas energia regular.
             is_spell = card.card_type == "spell"
             avail_energy = player.total_energy() if is_spell else player.energy
+
             if cost > avail_energy:
                 excluded_iids.add(card.iid)
                 continue
@@ -277,7 +343,7 @@ class GameState:
                 player.hand.remove(card)
                 card.sick = True; card.tapped = False
                 card.temp_off = 0; card.temp_vit = 0
-                player._cost_reduction_next = max(0, cost_red - card.cost)
+                player._cost_reduction_next = 0
                 player.place_creature(card)
                 player.cards_played_this_turn += 1
                 player.cards_played_total += 1
@@ -287,11 +353,27 @@ class GameState:
                 if self._is_interaction_card(card):
                     player.interaction_plays += 1
                 log(f"🐉 [{player.name}] invoca '{card.name}' (custo {cost})", 2)
+                _log_play_reason(card, player, opp, self.turn)
+
+                # ── Registra first_act na pilha ───────────────────────────
+                fa_tags = [t for t in (card.effect_tags or [])
+                           if t.get("trigger") == "first_act"]
+                if fa_tags:
+                    self.effect_stack.push(
+                        "Primeiro Ato",
+                        card.name,
+                        f"entra em campo com {len(fa_tags)} efeito(s)"
+                    )
+
+                self.effect_stack.begin_resolve()
                 self.engine.resolve_tags(card, "first_act", player)
+                self.effect_stack.end_resolve()
+                self.effect_stack.flush_log()
+
                 self.engine.resolve_tags(player.hero,
                                          "on_first_act_triggered",
                                          player, {"card": card})
-                played_any = True
+                played_this_turn.append(card)
                 continue
 
             # Feitiço/encanto/terreno
@@ -302,7 +384,6 @@ class GameState:
                 if not self._spell_useful(card, player, opp):
                     excluded_iids.add(card.iid)
                     continue
-                # Feitiço pode usar reserva; encanto/terreno não
                 _allow_res = (card.card_type == "spell")
                 if not player.spend(cost, allow_reserve=_allow_res):
                     excluded_iids.add(card.iid)
@@ -323,8 +404,10 @@ class GameState:
                 if card.card_type in ("enchant", "terrain"):
                     player.spells_field.append(card)
                     log(f"🌍 [{player.name}] coloca '{card.name}'", 2)
+                    _log_play_reason(card, player, opp, self.turn)
                 else:
                     log(f"🪄 [{player.name}] conjura '{card.name}' (custo {cost})", 2)
+                    _log_play_reason(card, player, opp, self.turn)
                     player.spells_cast_this_turn += 1
                     player.spells_cast_total += 1
 
@@ -332,10 +415,10 @@ class GameState:
                 if self._is_interaction_card(card):
                     player.interaction_plays += 1
                 self.engine.resolve_tags(card, "on_play", player)
-                for c in player.field_creatures:
+                for c in list(player.field_creatures):
                     self.engine.resolve_tags(c, "on_spell_cast", player)
                 player.graveyard.append(card)
-                played_any = True
+                played_this_turn.append(card)
                 continue
 
             # Artefato
@@ -361,15 +444,16 @@ class GameState:
                     player.interaction_plays += 1
                 self.engine.resolve_tags(card, "on_play", player)
                 log(f"🛡️  [{player.name}] equipa '{card.name}' no slot {slot}", 2)
-                played_any = True
+                _log_play_reason(card, player, opp, self.turn)
+                played_this_turn.append(card)
                 continue
 
             excluded_iids.add(card.iid)
 
         log(f"📊 {player.name}: vida {player.life} | "
             f"campo {player.field_size()} | mão {len(player.hand)}", 2)
-        creature_plays_this_turn = max(0, player.cards_played_this_turn - player.spells_cast_this_turn)
-        if player.cards_played_this_turn >= 2 and player.spells_cast_this_turn >= 1 and creature_plays_this_turn >= 1:
+        creature_plays = max(0, player.cards_played_this_turn - player.spells_cast_this_turn)
+        if player.cards_played_this_turn >= 2 and player.spells_cast_this_turn >= 1 and creature_plays >= 1:
             player.combo_turns += 1
         if player.hero_level >= 3:
             player.level3_reached = True
@@ -389,39 +473,19 @@ class GameState:
     def phase_combat(self, player: Player):
         log(f"\n⚔️  COMBATE — {player.name}", 1)
         opp = self.opponent(player)
+        self.effect_stack.reset()
 
         if player.hero.id == "hero_tesslia" and player.hero_level >= 1:
             cmd = player.commander()
             attackers = [cmd] if cmd and cmd.can_attack() else []
         else:
-            can_attack = [c for c in player.field_creatures if c.can_attack()]
-            base = AI.choose_attackers(player, opp)
-            if self.rl_runtime is None or not can_attack:
-                attackers = base
-            else:
-                styles = ["safe", "all", "evasive", "none"]
-                style = self.rl_runtime.decide_attack_style(self, player, opp, styles)
-                if style == "none":
-                    attackers = []
-                elif style == "all":
-                    attackers = can_attack
-                elif style == "evasive":
-                    attackers = [
-                        c for c in can_attack
-                        if c.has_kw("Furtivo") or c.has_kw("Voar") or c.has_kw("Investida")
-                    ]
-                    if not attackers:
-                        attackers = base
-                else:
-                    attackers = base
+            attackers = AI.choose_attackers(player, opp)
 
         if not attackers:
             log("Sem atacantes.", 2)
             return
 
-        # Regra: resolução dos combates da esquerda para direita (por slot)
         attackers.sort(key=lambda c: c.slot if c.slot is not None else 99)
-
         log(f"Atacando com: {', '.join(c.name for c in attackers)}", 2)
 
         blocks = AI.choose_blockers(attackers, opp, player)
@@ -434,7 +498,6 @@ class GameState:
             else:
                 log(f"💥 '{atk.name}' — ataque direto!", 2)
 
-        # Hook: defensor pode responder com feitiço Acelerado antes do dano
         accel = AI.choose_accelerated_response(opp, player, context="combat")
         if accel and accel.cost <= opp.total_energy():
             if opp.spend(accel.cost, allow_reserve=True):
@@ -446,7 +509,6 @@ class GameState:
                 opp.graveyard.append(accel)
                 attackers = [a for a in attackers if a in player.field_creatures]
 
-        # Detecta Defensor X: bloqueador que aparece em múltiplas entradas
         blocker_to_attackers: dict[int, list] = {}
         for atk in attackers:
             for blk in blocks.get(atk.iid, []):
@@ -455,7 +517,6 @@ class GameState:
         defensor_resolved_atk_iids: set[int] = set()
         for blk_iid, atk_list in blocker_to_attackers.items():
             if len(atk_list) > 1:
-                # Localiza o objeto bloqueador
                 blk = next(
                     (b for a in atk_list for b in blocks.get(a.iid, []) if b.iid == blk_iid),
                     None
@@ -468,7 +529,7 @@ class GameState:
         for atk in attackers:
             atk.tapped = True
             if atk.iid in defensor_resolved_atk_iids:
-                continue  # já resolvido como Defensor X
+                continue
             blks = blocks.get(atk.iid, [])
             if not blks:
                 dmg = atk.cur_off()
@@ -477,8 +538,13 @@ class GameState:
                 log(f"💢 '{atk.name}' causa {dmg} → vida {opp.name}: {opp.life}", 2)
                 if atk.has_kw("Roubo de Vida"):
                     player.heal(dmg)
-            else:
+            elif len(blks) == 1:
                 self._resolve_creature_combat(atk, blks[0], player, opp)
+            else:
+                self._resolve_gang_block(atk, blks, player, opp)
+
+            # ── Exibe cadeia de efeitos do combate se houver ──────────────
+            self.effect_stack.flush_log()
 
             if player.hero.id == "hero_tesslia" and atk is player.commander():
                 player.levelup_counter += 1
@@ -490,17 +556,9 @@ class GameState:
 
     def _resolve_defensor_block(self, blk: CardInst, attackers: list[CardInst],
                                  blk_owner: Player, atk_owner: Player):
-        """
-        Resolve Defensor X: 1 bloqueador vs N atacantes simultaneamente.
-        Regra: bloqueador recebe dano de TODOS os atacantes.
-        Bloqueador concentra seu dano no atacante de maior valor que consiga matar,
-        ou no mais forte se não conseguir matar nenhum.
-        Atacantes NÃO causam dano ao herói (estão bloqueados).
-        """
         log(f"🛡️  Defensor '{blk.name}' ({blk.cur_off()}/{blk.cur_vit()}) bloqueia "
             f"{', '.join(a.name for a in attackers)}", 2)
 
-        # Dano total recebido pelo bloqueador (simultâneo)
         total_incoming = 0
         any_atk_tdm = False
         for atk in attackers:
@@ -511,12 +569,10 @@ class GameState:
             if atk.has_kw("Toque da Morte") and atk.cur_off() > 0:
                 any_atk_tdm = True
 
-        # Aplica dano ao bloqueador
         if not blk.has_kw("Indestrutivel"):
             blk.vitality -= total_incoming
         blk_dies = (blk.cur_vit() <= 0 or any_atk_tdm) and not blk.has_kw("Indestrutivel")
 
-        # Bloqueador escolhe 1 alvo para seu dano (maior valor que consegue matar)
         blk_dmg = blk.cur_off()
         if blk.has_kw("Congelado") or blk.has_kw("Sufocado"):
             blk_dmg = 0
@@ -527,11 +583,10 @@ class GameState:
                         if not a.has_kw("Indestrutivel")
                         and (blk.has_kw("Toque da Morte") or a.cur_vit() <= blk_dmg)]
             if killable:
-                target_atk = max(killable, key=lambda a: card_value(a, atk_owner))
+                target_atk = max(killable, key=lambda a: a.cur_off() + a.cur_vit())
             else:
                 target_atk = max(attackers, key=lambda a: a.cur_off())
 
-        # Destrói atacantes alvo do dano do bloqueador
         if target_atk and blk_dmg > 0:
             recv = max(0, blk_dmg - (1 if target_atk.has_kw("Robusto") else 0))
             target_atk.vitality -= recv
@@ -542,13 +597,11 @@ class GameState:
                 self.destroy_creature(target_atk, atk_owner)
                 log(f"💀 '{target_atk.name}' destruído pelo Defensor", 2)
 
-        # Resolve Atropelar dos atacantes não mortos pelo Defensor
         for atk in attackers:
             if atk not in atk_owner.field_creatures:
-                continue  # foi destruído
+                continue
             if atk.has_kw("Atropelar") and total_incoming > 0:
-                # Calcula excesso apenas sobre a vitalidade do bloqueador
-                excess = max(0, atk.cur_off() - blk.base_vit)
+                excess = max(0, atk.cur_off() - blk.cur_vit())
                 if excess > 0:
                     blk_owner.life -= excess
                     atk_owner.stats_damage_dealt += excess
@@ -556,18 +609,17 @@ class GameState:
             if atk.has_kw("Roubo de Vida"):
                 atk_owner.heal(atk.cur_off())
 
-        # Destrói bloqueador se necessário
         if blk_dies and blk in blk_owner.field_creatures:
             atk_owner.kills += 1
             self.destroy_creature(blk, blk_owner)
 
         log(f"   Defensor {'💀' if blk_dies else '✓'}  "
             f"alvo='{target_atk.name if target_atk else '—'}'", 2)
-        """Resolve combate com múltiplos bloqueadores em um único atacante (gang block)."""
+
+    def _resolve_gang_block(self, atk, blockers, atk_owner, blk_owner):
         log(f"⚔️  '{atk.name}' ({atk.cur_off()}/{atk.cur_vit()}) vs "
             f"{', '.join(b.name for b in blockers)} (gang block)", 2)
 
-        # Verifica Veloz: atacante age antes se consegue matar TODOS antes de sofrer dano
         veloz_immunity = False
         if atk.has_kw("Veloz"):
             sim_pool = atk.cur_off()
@@ -584,7 +636,6 @@ class GameState:
                 sim_pool -= lethal
             veloz_immunity = would_kill_all
 
-        # Bloqueadores causam dano simultâneo ao atacante (exceto se Veloz matou todos)
         atk_damage_taken = 0
         any_blk_tdm = False
         if not veloz_immunity:
@@ -599,7 +650,6 @@ class GameState:
         if atk.has_kw("Indestrutivel"):
             atk_dies = False
 
-        # Atacante distribui dano: mata menores primeiro (escolha ótima do atacante)
         atk_pool = atk.cur_off()
         killed_blockers = []
         for blk in sorted(blockers, key=lambda b: b.cur_vit()):
@@ -619,25 +669,21 @@ class GameState:
             else:
                 atk_pool = 0
 
-        # Destroi bloqueadores mortos
         for blk in killed_blockers:
             if blk in blk_owner.field_creatures:
                 atk_owner.kills += 1
                 self.destroy_creature(blk, blk_owner)
 
-        # Destroi atacante se necessário
         if atk_dies and atk in atk_owner.field_creatures:
             blk_owner.kills += 1
             self.destroy_creature(atk, atk_owner)
 
-        # Atropelar: excesso vai ao herói SOMENTE se TODOS os bloqueadores morreram
         all_killed = len(killed_blockers) == len(blockers)
         if not atk_dies and atk.has_kw("Atropelar") and all_killed and atk_pool > 0:
             blk_owner.life -= atk_pool
             atk_owner.stats_damage_dealt += atk_pool
             log(f"🐂 '{atk.name}' Atropelar: +{atk_pool} ao herói {blk_owner.name}", 2)
 
-        # Roubo de Vida
         if not atk_dies and atk.has_kw("Roubo de Vida"):
             atk_owner.heal(atk.cur_off())
 
@@ -659,8 +705,8 @@ class GameState:
             if blk_killed:
                 atk_owner.kills += 1
                 self.destroy_creature(blk, blk_owner)
-                if atk.has_kw("Atropelar") and atk_dmg > blk.base_vit:
-                    excess = atk_dmg - blk.base_vit
+                if atk.has_kw("Atropelar") and atk_dmg > blk.cur_vit():
+                    excess = atk_dmg - blk.cur_vit()
                     blk_owner.life -= excess
                     atk_owner.stats_damage_dealt += excess
                 return
@@ -677,8 +723,8 @@ class GameState:
         if blk_died:
             atk_owner.kills += 1
             self.destroy_creature(blk, blk_owner)
-            if atk.has_kw("Atropelar") and atk_dmg > blk.base_vit:
-                excess = atk_dmg - blk.base_vit
+            if atk.has_kw("Atropelar") and atk_dmg > blk.cur_vit():
+                excess = atk_dmg - blk.cur_vit()
                 blk_owner.life -= excess
                 atk_owner.stats_damage_dealt += excess
 
@@ -698,14 +744,14 @@ class GameState:
                 player.energy  -= transfer
         player.energy = 0
 
-        for c in player.field_creatures:
+        for c in list(player.field_creatures):
             c.temp_off = 0
             c.temp_vit = 0
 
         self.engine.resolve_tags(player.hero, "end_of_turn", player)
-        for c in player.field_creatures:
+        for c in list(player.field_creatures):
             self.engine.resolve_tags(c, "end_of_turn", player)
-        for enc in player.spells_field:
+        for enc in list(player.spells_field):
             self.engine.resolve_tags(enc, "end_of_turn", player)
 
         if player.hero.id == "hero_rasmus" and player.hero_level >= 1:
@@ -744,36 +790,29 @@ class GameState:
             self.phase_main(cur)
             self.phase_combat(cur)
             if self.winner:
-                if self.rl_runtime is not None:
-                    self.rl_runtime.on_turn_end(self, cur, self.opponent(cur))
                 break
 
             self.phase_end(cur)
-            if self.rl_runtime is not None:
-                self.rl_runtime.on_turn_end(self, cur, self.opponent(cur))
             v = self.check_victory()
             if v:
                 self.winner = v
                 break
 
-        if self.rl_runtime is not None:
-            self.rl_runtime.on_game_end(self)
-
         def _metrics(p: Player) -> dict:
             mana_eff = p.mana_spent_total / p.mana_budget_total if p.mana_budget_total > 0 else 0.0
             return {
-                "mana_spent_total": p.mana_spent_total,
-                "mana_budget_total": p.mana_budget_total,
-                "mana_efficiency": mana_eff,
-                "max_energy_reached": p.max_energy_reached,
-                "cards_played_total": p.cards_played_total,
-                "spells_cast_total": p.spells_cast_total,
-                "creatures_played_total": p.creatures_played_total,
-                "combo_turns": p.combo_turns,
-                "interaction_plays": p.interaction_plays,
-                "turns_played": p.turns_played,
-                "life_min": p.life_min,
-                "level3_reached": p.level3_reached,
+                "mana_spent_total":      p.mana_spent_total,
+                "mana_budget_total":     p.mana_budget_total,
+                "mana_efficiency":       mana_eff,
+                "max_energy_reached":    p.max_energy_reached,
+                "cards_played_total":    p.cards_played_total,
+                "spells_cast_total":     p.spells_cast_total,
+                "creatures_played_total":p.creatures_played_total,
+                "combo_turns":           p.combo_turns,
+                "interaction_plays":     p.interaction_plays,
+                "turns_played":          p.turns_played,
+                "life_min":              p.life_min,
+                "level3_reached":        p.level3_reached,
             }
 
         return {

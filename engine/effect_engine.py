@@ -129,6 +129,8 @@ class EffectEngine:
                     o2.hand.append(t)
                     t.sick = True; t.tapped = False
                     t.temp_off = 0; t.temp_vit = 0
+                    t.status.clear()
+                    t.offense = t.base_off; t.vitality = t.base_vit
                     log(f"↩️  '{t.name}' retorna para mão de {o2.name}", 3)
 
         elif action == "mill":
@@ -160,7 +162,9 @@ class EffectEngine:
                 if c.card_type == "creature" and self._matches_filter(c, filt):
                     owner.graveyard.remove(c)
                     c.sick = True; c.tapped = False
-                    c.vitality = c.base_vit; c.temp_off = 0; c.temp_vit = 0
+                    c.offense  = c.base_off; c.vitality = c.base_vit
+                    c.temp_off = 0; c.temp_vit = 0
+                    c.status.clear(); c.markers.clear()
                     if owner.field_size() < 5:
                         owner.place_creature(c)
                         log(f"✨ '{c.name}' ressuscitada", 3)
@@ -260,9 +264,8 @@ class EffectEngine:
                     dc.vitality = 1
 
         elif action == "commander_buff":
-            if owner.field_creatures:
-                mid = len(owner.field_creatures) // 2
-                cmd = owner.field_creatures[mid]
+            cmd = owner.commander()   # usa slot real via commander_slot()
+            if cmd is not None:
                 off_b, vit_b = self._parse_buff(tag.get("value", "+2/0"), owner, ctx)
                 cmd.temp_off += off_b
                 if "Atropelar" not in cmd.keywords and owner.hero_level >= 2:
@@ -379,6 +382,9 @@ class EffectEngine:
             return value
         if value == "X":
             return self._x_value("", owner, None, ctx)
+        # Suporte a strings de x_source diretas (ex: value:"deaths_this_turn")
+        if isinstance(value, str):
+            return self._x_value(value, owner, None, ctx)
         return 0
 
     def _x_value(self, source: str, owner: "Player", opp, ctx: dict) -> int:
@@ -433,10 +439,16 @@ class EffectEngine:
         if target_type == "all_creatures":
             return owner.field_creatures + opp.field_creatures
         if target_type == "adjacent_allies":
-            idx = owner.field_creatures.index(card) if card in owner.field_creatures else -1
-            return [owner.field_creatures[idx + di]
-                    for di in (-1, 1)
-                    if 0 <= idx + di < len(owner.field_creatures)]
+            # Usa slot real (esparso) — NÃO o índice da lista compacta
+            slot = owner.slot_of(card)
+            if slot < 0:
+                return []
+            result = []
+            for di in (-1, 1):
+                ns = slot + di
+                if 0 <= ns < len(owner._slots) and owner._slots[ns] is not None:
+                    result.append(owner._slots[ns])
+            return result
         if target_type == "attached_creature":
             return [c for c in owner.field_creatures if c.iid == card.linked_to]
         if target_type == "commander":
@@ -511,7 +523,7 @@ class EffectEngine:
             log(f"🖼️  [{owner.name}] cria imagem '{img.name}'", 3)
 
     def _investigate(self, deck_owner: "Player", n: int, investigator: "Player"):
-        top = deck_owner.deck[:n]
+        top = list(deck_owner.deck[:n])
         log(f"🔍 [{investigator.name}] investiga {n} carta(s) de {deck_owner.name}", 3)
         for c in top:
             deck_owner.deck.remove(c)
@@ -525,7 +537,7 @@ class EffectEngine:
                               investigator, {"revealed_cards": top})
 
     def _on_owner_lose_life(self, owner: "Player", amount: int):
-        for c in owner.field_creatures:
+        for c in list(owner.field_creatures):
             self.resolve_tags(c, "on_owner_lose_life", owner, {"amount": amount})
-        for enc in owner.spells_field:
+        for enc in list(owner.spells_field):
             self.resolve_tags(enc, "on_owner_lose_life", owner, {"amount": amount})

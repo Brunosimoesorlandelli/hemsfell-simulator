@@ -19,13 +19,12 @@ def build_matrix(n_games: int, data: dict, card_pool: dict, tags_db: dict) -> st
     heroes = [h["id"] for h in data.get("heroes", [])]
     names  = {h["id"]: h["name"][:10] for h in data.get("heroes", [])}
 
-    # win_rate[h1][h2] = % de vitória de h1 contra h2
     win_rate: dict[str, dict[str, float]] = {h: {} for h in heroes}
 
     total = len(heroes) * (len(heroes) - 1) // 2
     done  = 0
     for i, h1 in enumerate(heroes):
-        for h2 in heroes[i+1:]:
+        for h2 in heroes[i + 1:]:
             done += 1
             print(f"\r  [{done}/{total}] {names[h1]} vs {names[h2]}…", end="", flush=True)
             stats = run_matchup(h1, h2, n_games, data, card_pool, tags_db)
@@ -36,10 +35,14 @@ def build_matrix(n_games: int, data: dict, card_pool: dict, tags_db: dict) -> st
             win_rate[h2][h1] = 100 * (n - w1) / n
     print()
 
-    # renderiza tabela ASCII
-    col_w = 11
+    col_w  = 11
     header = " " * 12 + "".join(names[h].ljust(col_w) for h in heroes)
-    lines  = ["", "MATCHUP MATRIX (% vitória da linha contra a coluna)", "─"*len(header), header]
+    lines  = [
+        "",
+        "MATCHUP MATRIX (% vitória da linha contra a coluna)",
+        "─" * len(header),
+        header,
+    ]
     for h1 in heroes:
         row = names[h1].ljust(12)
         for h2 in heroes:
@@ -50,11 +53,10 @@ def build_matrix(n_games: int, data: dict, card_pool: dict, tags_db: dict) -> st
                 row += f"{v:5.1f}%".ljust(col_w)
         lines.append(row)
 
-    # ranking por win-rate média
-    avg = {}
+    avg    = {}
     for h in heroes:
-        vals = [v for h2, v in win_rate[h].items() if h2 != h]
-        avg[h] = sum(vals)/len(vals) if vals else 0
+        vals   = [v for h2, v in win_rate[h].items() if h2 != h]
+        avg[h] = sum(vals) / len(vals) if vals else 0
     ranked = sorted(avg.items(), key=lambda x: x[1], reverse=True)
     lines.append("")
     lines.append("RANKING POR WIN-RATE MÉDIA:")

@@ -9,15 +9,25 @@ Uso via main.py:
 """
 
 from __future__ import annotations
-import sys, os, random
+import sys, os, random, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from engine.models import Player
+from engine.models import Player, reset_iid
 from engine.simulator import GameState
-from engine.rl_agent import DQNPolicy, RLEpisodeRuntime
 from engine.loader import load_data, build_card_pool, load_tags, build_deck_for_hero, hero_list
 from engine.stats import Stats, save_report
 from engine import logger
+
+
+def _fmt_time(seconds: float) -> str:
+    """Formata segundos em mm:ss ou hh:mm:ss."""
+    seconds = int(seconds)
+    if seconds < 3600:
+        return f"{seconds // 60:02d}:{seconds % 60:02d}"
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 def run_matchup(
@@ -28,17 +38,23 @@ def run_matchup(
     card_pool: dict,
     tags_db: dict,
     verbose: bool = False,
-    rl_policy_path: str | None = None,
     seed_base: int | None = None,
+    _progress_prefix: str = "",
+    output_path: str | None = None,
 ) -> Stats:
     """Simula n_games entre dois heróis e retorna Stats."""
     logger.set_verbose(verbose)
 
-    names = {h["id"]: h["name"] for h in data.get("heroes", [])}
+    names   = {h["id"]: h["name"] for h in data.get("heroes", [])}
     p1_name = f"J1 ({names.get(hero1_id, hero1_id)})"
     p2_name = f"J2 ({names.get(hero2_id, hero2_id)})"
     stats   = Stats(hero1_id, hero2_id)
-    policy = DQNPolicy.load(rl_policy_path) if rl_policy_path else None
+
+    # Escreve cabeçalho do arquivo uma única vez antes de iniciar as partidas
+    if output_path:
+        logger.write_header(output_path, p1_name, p2_name, n_games)
+
+    t_start = time.perf_counter()
 
     for g in range(n_games):
         logger.clear()
@@ -47,7 +63,6 @@ def run_matchup(
         else:
             random.seed(seed_base + g * 997)
 
-        from engine.models import reset_iid
         reset_iid()
 
         h1, d1 = build_deck_for_hero(hero1_id, data, card_pool, tags_db)
@@ -56,26 +71,44 @@ def run_matchup(
         p2 = Player(name=p2_name, hero=h2, deck=d2)
 
         gs     = GameState(p1, p2, card_pool, tags_db)
-        if policy is not None:
-            gs.rl_runtime = RLEpisodeRuntime(
-                policy=policy,
-                training=False,
-                epsilon=0.0,
-                alpha=0.0,
-            )
         result = gs.run()
         stats.add(result)
+
+        # Sempre despeja o log completo da partida no arquivo
+        if output_path:
+            logger.dump_to_file(output_path, g + 1, result["winner"])
 
         if verbose and g == 0:
             print("\n".join(logger.get_lines()))
 
         if not verbose and n_games > 1:
-            pct = (g+1)/n_games*100
-            bar = "#" * int(pct/5) + "-" * (20-int(pct/5))
-            print(f"\r  [{bar}] {pct:5.1f}%  {g+1}/{n_games}", end="", flush=True)
+            elapsed   = time.perf_counter() - t_start
+            avg_time  = elapsed / (g + 1)
+            remaining = avg_time * (n_games - g - 1)
+            pct       = (g + 1) / n_games * 100
+            bar       = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
+            prefix    = f"  {_progress_prefix} " if _progress_prefix else "  "
+            print(
+                f"\r{prefix}[{bar}] {pct:5.1f}%  "
+                f"{g+1}/{n_games} partidas  "
+                f"~{_fmt_time(remaining)} restante",
+                end="", flush=True,
+            )
 
     if not verbose and n_games > 1:
-        print()
+        elapsed = time.perf_counter() - t_start
+        r   = stats.results
+        n   = len(r)
+        w1  = sum(1 for x in r if x["winner"] == x["p1_name"])
+        wr_p1 = 100 * w1 / n
+        print(
+            f"\r  {_progress_prefix}  ✓  "
+            f"{names.get(hero1_id, hero1_id)[:10]} {wr_p1:.0f}% "
+            f"× {100 - wr_p1:.0f}% "
+            f"{names.get(hero2_id, hero2_id)[:10]}"
+            f"  ({_fmt_time(elapsed)})"
+            + " " * 20
+        )
 
     return stats
 
@@ -86,30 +119,45 @@ def run_all_matchups(
     card_pool: dict,
     tags_db: dict,
     output_path: str,
-    rl_policy_path: str | None = None,
 ) -> list[str]:
     """Simula todos os confrontos 1v1 e retorna lista de relatórios."""
     heroes   = [h["id"] for h in data.get("heroes", [])]
     matchups = [(h1, h2)
                 for i, h1 in enumerate(heroes)
-                for h2 in heroes[i+1:]]
+                for h2 in heroes[i + 1:]]
 
-    print(f"\n🎮 Simulando {len(matchups)} confrontos × {n_games} partidas…\n")
+    total_matchups = len(matchups)
+    total_games    = total_matchups * n_games
 
-    reports = []
-    for h1, h2 in matchups:
-        print(f"  {h1} vs {h2} …", end="", flush=True)
+    print(f"\n🎮 {total_matchups} confrontos × {n_games} partidas = {total_games} jogos\n")
+
+    reports  = []
+    t_global = time.perf_counter()
+
+    for idx, (h1, h2) in enumerate(matchups, 1):
+        elapsed_global  = time.perf_counter() - t_global
+        avg_per_matchup = elapsed_global / (idx - 1) if idx > 1 else 0
+        eta_global      = avg_per_matchup * (total_matchups - idx + 1)
+        eta_str         = f"  ETA global: {_fmt_time(eta_global)}" if idx > 1 else ""
+
+        names = {h["id"]: h["name"][:10] for h in data.get("heroes", [])}
+        print(
+            f"  [{idx:>2}/{total_matchups}] "
+            f"{names.get(h1, h1)} vs {names.get(h2, h2)}"
+            f"{eta_str}"
+        )
+
         stats = run_matchup(
             h1, h2, n_games, data, card_pool, tags_db,
-            verbose=False, rl_policy_path=rl_policy_path
+            verbose=False,
+            _progress_prefix=f"[{idx}/{total_matchups}]",
+            output_path=output_path,
         )
-        rep   = stats.report()
+        rep = stats.report()
         reports.append(rep)
 
-        r  = stats.results
-        n  = len(r)
-        w1 = sum(1 for x in r if x["winner"] == x["p1_name"])
-        print(f" {100*w1/n:.0f}% vs {100*(n-w1)/n:.0f}%")
+    total_elapsed = time.perf_counter() - t_global
+    print(f"\n✅ Concluído em {_fmt_time(total_elapsed)}  ({total_games} partidas simuladas)")
 
-    save_report(reports, output_path)
+    save_report(reports, output_path, append=True)
     return reports
